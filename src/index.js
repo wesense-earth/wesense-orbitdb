@@ -40,10 +40,10 @@ const PORT = parseInt(process.env.PORT || "5200", 10);
 const LIBP2P_PORT = parseInt(process.env.LIBP2P_PORT || "4002", 10);
 const DATA_DIR = process.env.DATA_DIR || "./data";
 const ANNOUNCE_ADDRESS = process.env.ANNOUNCE_ADDRESS || "";
+const BOOTSTRAP_PEERS = process.env.ORBITDB_BOOTSTRAP_PEERS || "";
 
 // Public IPFS bootstrap nodes (from Helia/kubo defaults).
-// These are the entry points into the IPFS DHT — through them,
-// OrbitDB instances discover each other automatically across the internet.
+// These are the entry points into the IPFS DHT.
 const IPFS_BOOTSTRAP_NODES = [
   "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
   "/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
@@ -51,6 +51,13 @@ const IPFS_BOOTSTRAP_NODES = [
   "/dnsaddr/va1.bootstrap.libp2p.io/p2p/12D3KooWKnDdG3iXw9eTFijk3EWSunZcFi54Zka4wmtqtt6rPxc8",
   "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
 ];
+
+// Additional bootstrap peers — other WeSense OrbitDB instances to connect to
+// directly. Comma-separated multiaddrs, e.g.:
+//   /ip4/203.0.113.1/tcp/4002/p2p/12D3KooW...
+const WESENSE_BOOTSTRAP_PEERS = BOOTSTRAP_PEERS
+  ? BOOTSTRAP_PEERS.split(",").map((s) => s.trim()).filter(Boolean)
+  : [];
 
 const DISCOVERY_INTERVAL = 60_000; // Search for peers every 60 seconds
 const PROVIDE_INTERVAL = 30 * 60_000; // Re-announce to DHT every 30 minutes
@@ -164,7 +171,7 @@ async function main() {
     streamMuxers: [yamux()],
     peerDiscovery: [
       mdns(),
-      bootstrap({ list: IPFS_BOOTSTRAP_NODES }),
+      bootstrap({ list: [...IPFS_BOOTSTRAP_NODES, ...WESENSE_BOOTSTRAP_PEERS] }),
     ],
     services: {
       identify: identify(),
@@ -177,6 +184,9 @@ async function main() {
   const helia = await createHelia({ libp2p, blockstore, datastore });
   console.log(`Helia peer ID: ${helia.libp2p.peerId.toString()}`);
   console.log(`Announced addresses: ${helia.libp2p.getMultiaddrs().map((a) => a.toString()).join(", ")}`);
+  if (WESENSE_BOOTSTRAP_PEERS.length > 0) {
+    console.log(`Bootstrap peers: ${WESENSE_BOOTSTRAP_PEERS.join(", ")}`);
+  }
 
   // Log peer connections and disconnections
   helia.libp2p.addEventListener("peer:connect", (evt) => {
