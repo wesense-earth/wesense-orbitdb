@@ -11,7 +11,7 @@ import { noise } from "@chainsafe/libp2p-noise";
 import { yamux } from "@chainsafe/libp2p-yamux";
 import { tcp } from "@libp2p/tcp";
 import { mdns } from "@libp2p/mdns";
-import { gossipsub } from "@libp2p/gossipsub";
+import { gossipsub } from "@chainsafe/libp2p-gossipsub";
 import { identify } from "@libp2p/identify";
 import { bootstrap } from "@libp2p/bootstrap";
 import { FsBlockstore } from "blockstore-fs";
