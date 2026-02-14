@@ -19,6 +19,7 @@ import { gossipsub } from "@chainsafe/libp2p-gossipsub";
 import { identify } from "@libp2p/identify";
 import { bootstrap } from "@libp2p/bootstrap";
 import { kadDHT } from "@libp2p/kad-dht";
+import { ping } from "@libp2p/ping";
 import { FsBlockstore } from "blockstore-fs";
 import { FsDatastore } from "datastore-fs";
 import { createOrbitDB } from "@orbitdb/core";
@@ -66,6 +67,7 @@ async function main() {
     ],
     services: {
       identify: identify(),
+      ping: ping(),
       pubsub: gossipsub({ allowPublishToZeroTopicPeers: true }),
       aminoDHT: kadDHT({ protocol: "/ipfs/kad/1.0.0" }),
     },
