@@ -43,6 +43,7 @@ export function createAttestationsRouter(attestationsDb) {
       }
 
       const doc = {
+        _id: manifest_hash,
         manifest_hash,
         attestations,
         updated_at: new Date().toISOString(),
