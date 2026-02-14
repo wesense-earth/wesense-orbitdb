@@ -98,8 +98,16 @@ function startPeerDiscovery(helia, dbs) {
         if (provider.id.equals(myPeerId)) continue;
         if (connectedPeers.has(provider.id.toString())) continue;
 
-        console.log(`DHT: Discovered database peer ${provider.id}`);
+        const addrs = (provider.multiaddrs || []).map((a) => a.toString());
+        console.log(`DHT: Discovered peer ${provider.id} addrs=[${addrs.join(", ")}]`);
+
         try {
+          if (addrs.length > 0) {
+            // Store the provider's addresses before dialing
+            await helia.libp2p.peerStore.merge(provider.id, {
+              multiaddrs: provider.multiaddrs,
+            });
+          }
           await helia.libp2p.dial(provider.id);
           console.log(`DHT: Connected to peer ${provider.id}`);
         } catch (err) {
@@ -140,7 +148,13 @@ async function main() {
     ? [`/ip4/${ANNOUNCE_ADDRESS}/tcp/${LIBP2P_PORT}`]
     : [];
 
+  // Use a dedicated datastore for libp2p so identity keys are persisted
+  // across restarts (stable PeerID is critical for DHT provider records).
+  await mkdir(`${DATA_DIR}/libp2p`, { recursive: true });
+  const libp2pDatastore = new FsDatastore(`${DATA_DIR}/libp2p`);
+
   const libp2p = await createLibp2p({
+    datastore: libp2pDatastore,
     addresses: {
       listen: [`/ip4/0.0.0.0/tcp/${LIBP2P_PORT}`],
       announce,
