@@ -35,6 +35,7 @@ import { createHealthRouter } from "./routes/health.js";
 const PORT = parseInt(process.env.PORT || "5200", 10);
 const LIBP2P_PORT = parseInt(process.env.LIBP2P_PORT || "4002", 10);
 const DATA_DIR = process.env.DATA_DIR || "./data";
+const ANNOUNCE_ADDRESS = process.env.ANNOUNCE_ADDRESS || "";
 
 // Public IPFS bootstrap nodes (from Helia/kubo defaults).
 // These are the entry points into the IPFS DHT — through them,
@@ -56,8 +57,16 @@ async function main() {
   const blockstore = new FsBlockstore(`${DATA_DIR}/blockstore`);
   const datastore = new FsDatastore(`${DATA_DIR}/datastore`);
 
+  // Announce the host's real IP so peers on other Docker hosts can reach us
+  const announce = ANNOUNCE_ADDRESS
+    ? [`/ip4/${ANNOUNCE_ADDRESS}/tcp/${LIBP2P_PORT}`]
+    : [];
+
   const libp2p = await createLibp2p({
-    addresses: { listen: [`/ip4/0.0.0.0/tcp/${LIBP2P_PORT}`] },
+    addresses: {
+      listen: [`/ip4/0.0.0.0/tcp/${LIBP2P_PORT}`],
+      announce,
+    },
     transports: [tcp()],
     connectionEncrypters: [noise()],
     streamMuxers: [yamux()],
