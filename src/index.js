@@ -3,6 +3,10 @@
  *
  * Helia (IPFS) + OrbitDB + Express HTTP API for distributed
  * node registration, trust list sync, and archive attestations.
+ *
+ * Peer discovery is automatic:
+ *   - LAN: mDNS (zero config)
+ *   - WAN: Kademlia DHT via public IPFS bootstrap nodes
  */
 
 import { createHelia } from "helia";
@@ -14,6 +18,7 @@ import { mdns } from "@libp2p/mdns";
 import { gossipsub } from "@chainsafe/libp2p-gossipsub";
 import { identify } from "@libp2p/identify";
 import { bootstrap } from "@libp2p/bootstrap";
+import { kadDHT } from "@libp2p/kad-dht";
 import { FsBlockstore } from "blockstore-fs";
 import { FsDatastore } from "datastore-fs";
 import { createOrbitDB } from "@orbitdb/core";
@@ -29,9 +34,17 @@ import { createHealthRouter } from "./routes/health.js";
 const PORT = parseInt(process.env.PORT || "5200", 10);
 const LIBP2P_PORT = parseInt(process.env.LIBP2P_PORT || "4002", 10);
 const DATA_DIR = process.env.DATA_DIR || "./data";
-const BOOTSTRAP_PEERS = process.env.ORBITDB_BOOTSTRAP_PEERS
-  ? process.env.ORBITDB_BOOTSTRAP_PEERS.split(",").map((s) => s.trim()).filter(Boolean)
-  : [];
+
+// Public IPFS bootstrap nodes (from Helia/kubo defaults).
+// These are the entry points into the IPFS DHT — through them,
+// OrbitDB instances discover each other automatically across the internet.
+const IPFS_BOOTSTRAP_NODES = [
+  "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+  "/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+  "/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
+  "/dnsaddr/va1.bootstrap.libp2p.io/p2p/12D3KooWKnDdG3iXw9eTFijk3EWSunZcFi54Zka4wmtqtt6rPxc8",
+  "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
+];
 
 async function main() {
   // Ensure data directories exist
@@ -42,21 +55,19 @@ async function main() {
   const blockstore = new FsBlockstore(`${DATA_DIR}/blockstore`);
   const datastore = new FsDatastore(`${DATA_DIR}/datastore`);
 
-  // libp2p peer discovery: mDNS for LAN, optional bootstrap for WAN
-  const peerDiscovery = [mdns()];
-  if (BOOTSTRAP_PEERS.length > 0) {
-    peerDiscovery.push(bootstrap({ list: BOOTSTRAP_PEERS }));
-  }
-
   const libp2p = await createLibp2p({
     addresses: { listen: [`/ip4/0.0.0.0/tcp/${LIBP2P_PORT}`] },
     transports: [tcp()],
     connectionEncrypters: [noise()],
     streamMuxers: [yamux()],
-    peerDiscovery,
+    peerDiscovery: [
+      mdns(),
+      bootstrap({ list: IPFS_BOOTSTRAP_NODES }),
+    ],
     services: {
       identify: identify(),
       pubsub: gossipsub({ allowPublishToZeroTopicPeers: true }),
+      aminoDHT: kadDHT({ protocol: "/ipfs/kad/1.0.0" }),
     },
   });
 
