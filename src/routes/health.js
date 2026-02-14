@@ -21,10 +21,15 @@ export function createHealthRouter({ helia, dbs }) {
       const trustAll = await dbs.trust.all();
       const attestAll = await dbs.attestations.all();
 
+      // Get announced/listen addresses for debugging connectivity
+      const addrs = helia.libp2p.getMultiaddrs().map((a) => a.toString());
+
       res.json({
         status: "ok",
         peer_count: peers.length,
+        peers: peers.map((p) => p.toString()),
         libp2p_peer_id: helia.libp2p.peerId.toString(),
+        addresses: addrs,
         db_sizes: {
           nodes: nodesAll.length,
           trust: trustAll.length,
