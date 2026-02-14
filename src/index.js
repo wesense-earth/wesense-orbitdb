@@ -5,8 +5,10 @@
  * node registration, trust list sync, and archive attestations.
  *
  * Peer discovery is automatic:
- *   - LAN: mDNS (zero config)
- *   - WAN: Kademlia DHT via public IPFS bootstrap nodes
+ *   - LAN: mDNS (zero config, requires network_mode: host in Docker)
+ *   - WAN: IPFS DHT provider records — each station "provides" its
+ *     OrbitDB database CIDs to the global DHT and periodically searches
+ *     for other providers, dialing them when found
  */
 
 import { createHelia } from "helia";
@@ -23,6 +25,8 @@ import { ping } from "@libp2p/ping";
 import { FsBlockstore } from "blockstore-fs";
 import { FsDatastore } from "datastore-fs";
 import { createOrbitDB } from "@orbitdb/core";
+import { CID } from "multiformats/cid";
+import { base58btc } from "multiformats/bases/base58";
 import express from "express";
 import { mkdir } from "node:fs/promises";
 
@@ -47,6 +51,80 @@ const IPFS_BOOTSTRAP_NODES = [
   "/dnsaddr/va1.bootstrap.libp2p.io/p2p/12D3KooWKnDdG3iXw9eTFijk3EWSunZcFi54Zka4wmtqtt6rPxc8",
   "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
 ];
+
+const DISCOVERY_INTERVAL = 60_000; // Search for peers every 60 seconds
+const PROVIDE_INTERVAL = 30 * 60_000; // Re-announce to DHT every 30 minutes
+
+/**
+ * DHT-based peer discovery for OrbitDB replication.
+ *
+ * OrbitDB replicates via GossipSub, which requires a direct libp2p
+ * connection between peers. mDNS handles LAN discovery automatically
+ * (when using network_mode: host). For WAN, we use the IPFS DHT as
+ * a rendezvous: each station "provides" its OrbitDB database CIDs,
+ * and periodically searches for other providers of the same CIDs.
+ * When a new provider is found, we dial them — once connected,
+ * GossipSub kicks in and OrbitDB replicates.
+ */
+function startPeerDiscovery(helia, dbs) {
+  // Extract CIDs from OrbitDB database addresses (/orbitdb/zdpuAk...)
+  const dbCids = [dbs.nodes, dbs.trust, dbs.attestations].map((db) => {
+    const cidStr = db.address.toString().split("/").pop();
+    return CID.parse(cidStr, base58btc);
+  });
+
+  const provide = async () => {
+    for (const cid of dbCids) {
+      try {
+        await helia.routing.provide(cid, { signal: AbortSignal.timeout(30_000) });
+      } catch (err) {
+        console.warn(`DHT provide failed for ${cid}: ${err.message}`);
+      }
+    }
+    console.log("DHT: Provided database CIDs to IPFS network");
+  };
+
+  const discover = async () => {
+    const myPeerId = helia.libp2p.peerId;
+    const connectedPeers = new Set(helia.libp2p.getPeers().map((p) => p.toString()));
+
+    // Only need to search one database CID — all stations provide all three,
+    // so finding a provider for one means we'll connect and replicate all.
+    const cid = dbCids[0];
+    try {
+      for await (const provider of helia.routing.findProviders(cid, {
+        signal: AbortSignal.timeout(15_000),
+      })) {
+        if (provider.id.equals(myPeerId)) continue;
+        if (connectedPeers.has(provider.id.toString())) continue;
+
+        console.log(`DHT: Discovered database peer ${provider.id}`);
+        try {
+          await helia.libp2p.dial(provider.id);
+          console.log(`DHT: Connected to peer ${provider.id}`);
+        } catch (err) {
+          console.warn(`DHT: Failed to dial ${provider.id}: ${err.message}`);
+        }
+      }
+    } catch {
+      // Timeout or no providers found — normal, will retry
+    }
+  };
+
+  // Run initial provide + discover after a short delay (let libp2p settle)
+  setTimeout(async () => {
+    await provide();
+    await discover();
+  }, 10_000);
+
+  // Periodic re-provide (DHT records expire after ~24 hours)
+  setInterval(provide, PROVIDE_INTERVAL);
+
+  // Periodic discovery
+  setInterval(discover, DISCOVERY_INTERVAL);
+
+  console.log("DHT peer discovery started (provide + find every 60s)");
+}
 
 async function main() {
   // Ensure data directories exist
@@ -101,6 +179,9 @@ async function main() {
 
   const dbs = await openDatabases(orbitdb);
   console.log(`Databases opened — nodes: ${dbs.nodes.address}, trust: ${dbs.trust.address}`);
+
+  // Start DHT-based peer discovery for cross-station replication
+  startPeerDiscovery(helia, dbs);
 
   // Express HTTP API
   const app = express();
