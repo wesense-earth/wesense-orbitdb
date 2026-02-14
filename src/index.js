@@ -84,6 +84,15 @@ async function main() {
 
   const helia = await createHelia({ libp2p, blockstore, datastore });
   console.log(`Helia peer ID: ${helia.libp2p.peerId.toString()}`);
+  console.log(`Announced addresses: ${helia.libp2p.getMultiaddrs().map((a) => a.toString()).join(", ")}`);
+
+  // Log peer connections and disconnections
+  helia.libp2p.addEventListener("peer:connect", (evt) => {
+    console.log(`Peer connected: ${evt.detail.toString()}`);
+  });
+  helia.libp2p.addEventListener("peer:disconnect", (evt) => {
+    console.log(`Peer disconnected: ${evt.detail.toString()}`);
+  });
 
   const orbitdb = await createOrbitDB({
     ipfs: helia,
