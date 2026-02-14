@@ -19,6 +19,7 @@
     "@libp2p/ping": "^2.0.0",
     "express": "^4.21.0",
     "blockstore-fs": "^2.0.0",
-    "datastore-fs": "^10.0.0"
+    "datastore-fs": "^10.0.0",
+    "multiformats": "^13.0.0"
   }
 }
