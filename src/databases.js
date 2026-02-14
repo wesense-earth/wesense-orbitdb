@@ -12,20 +12,9 @@
  * @returns {Promise<{nodes: object, trust: object, attestations: object}>}
  */
 export async function openDatabases(orbitdb) {
-  const nodes = await orbitdb.open("wesense.nodes", {
-    type: "documents",
-    indexBy: "ingester_id",
-  });
-
-  const trust = await orbitdb.open("wesense.trust", {
-    type: "documents",
-    indexBy: "ingester_id",
-  });
-
-  const attestations = await orbitdb.open("wesense.attestations", {
-    type: "documents",
-    indexBy: "manifest_hash",
-  });
+  const nodes = await orbitdb.open("wesense.nodes", { type: "documents" });
+  const trust = await orbitdb.open("wesense.trust", { type: "documents" });
+  const attestations = await orbitdb.open("wesense.attestations", { type: "documents" });
 
   return { nodes, trust, attestations };
 }

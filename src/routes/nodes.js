@@ -20,6 +20,7 @@ export function createNodesRouter(nodesDb) {
     try {
       const ingester_id = req.params.id;
       const doc = {
+        _id: ingester_id,
         ingester_id,
         ...req.body,
         updated_at: new Date().toISOString(),

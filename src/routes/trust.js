@@ -40,6 +40,7 @@ export function createTrustRouter(trustDb) {
       };
 
       const doc = {
+        _id: ingester_id,
         ingester_id,
         versions,
         updated_at: new Date().toISOString(),
@@ -102,6 +103,7 @@ export function createTrustRouter(trustDb) {
       }
 
       const doc = {
+        _id: ingester_id,
         ingester_id,
         versions,
         updated_at: new Date().toISOString(),
