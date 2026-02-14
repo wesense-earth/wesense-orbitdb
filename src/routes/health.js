@@ -47,5 +47,24 @@ export function createHealthRouter({ helia, dbs }) {
     }
   });
 
+  // POST /health/dial — Manually connect to a peer by multiaddr (for debugging)
+  router.post("/dial", async (req, res) => {
+    try {
+      const { multiaddr } = req.body;
+      if (!multiaddr) {
+        return res.status(400).json({ error: "multiaddr required" });
+      }
+      const { multiaddr: createMa } = await import("@multiformats/multiaddr");
+      const addr = createMa(multiaddr);
+      console.log(`Manual dial: ${multiaddr}`);
+      const conn = await helia.libp2p.dial(addr);
+      console.log(`Manual dial connected: ${conn.remotePeer.toString()}`);
+      res.json({ status: "connected", remotePeer: conn.remotePeer.toString() });
+    } catch (err) {
+      console.error("POST /health/dial error:", err);
+      res.status(500).json({ status: "error", error: err.message });
+    }
+  });
+
   return router;
 }
