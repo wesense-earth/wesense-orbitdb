@@ -57,6 +57,8 @@ const IPFS_BOOTSTRAP_NODES = [
 //   Full multiaddr: /ip4/203.0.113.1/tcp/4002/p2p/12D3KooW...
 //   IP:port:        203.0.113.1:4002
 //   Just IP:        203.0.113.1  (uses LIBP2P_PORT)
+//   Hostname:       bootstrap.wesense.earth  (uses /dns4/)
+//   Hostname:port:  bootstrap.wesense.earth:4002
 function parseBootstrapPeers(peersStr, defaultPort) {
   if (!peersStr) return [];
   return peersStr
@@ -65,11 +67,15 @@ function parseBootstrapPeers(peersStr, defaultPort) {
     .filter(Boolean)
     .map((addr) => {
       if (addr.startsWith("/")) return addr;
+      let host, port;
       if (addr.includes(":")) {
-        const [ip, port] = addr.split(":");
-        return `/ip4/${ip}/tcp/${port}`;
+        [host, port] = addr.split(":");
+      } else {
+        host = addr;
+        port = defaultPort;
       }
-      return `/ip4/${addr}/tcp/${defaultPort}`;
+      const proto = /^[\d.]+$/.test(host) ? "ip4" : "dns4";
+      return `/${proto}/${host}/tcp/${port}`;
     });
 }
 
@@ -330,11 +336,11 @@ async function main() {
     const dialConfiguredPeers = async () => {
       for (const addr of WESENSE_PEER_ADDRS) {
         // Skip if already connected to a peer at this address
-        const targetIp = addr.match(/\/ip4\/([^/]+)\//)?.[1];
-        if (targetIp) {
+        const targetHost = addr.match(/\/(?:ip4|dns4)\/([^/]+)\//)?.[1];
+        if (targetHost) {
           const alreadyConnected = helia.libp2p
             .getConnections()
-            .some((c) => c.remoteAddr.toString().includes(targetIp));
+            .some((c) => c.remoteAddr.toString().includes(targetHost));
           if (alreadyConnected) continue;
         }
 
