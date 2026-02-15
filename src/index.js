@@ -342,9 +342,22 @@ async function main() {
   app.use("/attestations", createAttestationsRouter(dbs.attestations));
   app.use("/health", createHealthRouter({ helia, dbs }));
 
-  app.listen(PORT, () => {
-    console.log(`HTTP API listening on port ${PORT}`);
-  });
+  // Retry listen — with network_mode: host the previous container may not
+  // have fully released the port yet during a restart.
+  const startServer = (retries = 5, delay = 2000) => {
+    const server = app.listen(PORT, () => {
+      console.log(`HTTP API listening on port ${PORT}`);
+    });
+    server.on("error", (err) => {
+      if (err.code === "EADDRINUSE" && retries > 0) {
+        console.warn(`Port ${PORT} in use, retrying in ${delay / 1000}s (${retries} left)...`);
+        setTimeout(() => startServer(retries - 1, delay), delay);
+      } else {
+        throw err;
+      }
+    });
+  };
+  startServer();
 
   // Graceful shutdown
   const shutdown = async () => {
