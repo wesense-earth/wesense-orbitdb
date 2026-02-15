@@ -206,6 +206,23 @@ async function main() {
     console.log(`Configured peer addresses: ${WESENSE_PEER_ADDRS.join(", ")}`);
   }
 
+  // Explicitly dial any peer discovered via mDNS (or other discovery).
+  // We cannot rely on libp2p's auto-dialer because IPFS bootstrap peers
+  // fill the minConnections quota before mDNS-discovered WeSense stations
+  // get a chance. This ensures we always connect to LAN peers immediately.
+  helia.libp2p.addEventListener("peer:discovery", (evt) => {
+    const discoveredId = evt.detail.id;
+    if (helia.libp2p.getPeers().some((p) => p.equals(discoveredId))) return;
+    helia.libp2p.dial(discoveredId).then(
+      () => console.log(`Discovery dial: Connected to ${discoveredId}`),
+      (err) => {
+        if (!err.message?.includes("dial self")) {
+          console.warn(`Discovery dial: Failed ${discoveredId}: ${err.message}`);
+        }
+      }
+    );
+  });
+
   // Log peer connections and disconnections
   helia.libp2p.addEventListener("peer:connect", (evt) => {
     console.log(`Peer connected: ${evt.detail.toString()}`);
