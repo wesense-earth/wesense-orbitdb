@@ -52,12 +52,27 @@ const IPFS_BOOTSTRAP_NODES = [
   "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
 ];
 
-// Additional bootstrap peers — other WeSense OrbitDB instances to connect to
-// directly. Comma-separated multiaddrs, e.g.:
-//   /ip4/203.0.113.1/tcp/4002/p2p/12D3KooW...
-const WESENSE_BOOTSTRAP_PEERS = BOOTSTRAP_PEERS
-  ? BOOTSTRAP_PEERS.split(",").map((s) => s.trim()).filter(Boolean)
-  : [];
+// Parse ORBITDB_BOOTSTRAP_PEERS — supports multiple formats:
+//   Full multiaddr: /ip4/203.0.113.1/tcp/4002/p2p/12D3KooW...
+//   IP:port:        203.0.113.1:4002
+//   Just IP:        203.0.113.1  (uses LIBP2P_PORT)
+function parseBootstrapPeers(peersStr, defaultPort) {
+  if (!peersStr) return [];
+  return peersStr
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((addr) => {
+      if (addr.startsWith("/")) return addr;
+      if (addr.includes(":")) {
+        const [ip, port] = addr.split(":");
+        return `/ip4/${ip}/tcp/${port}`;
+      }
+      return `/ip4/${addr}/tcp/${defaultPort}`;
+    });
+}
+
+const WESENSE_PEER_ADDRS = parseBootstrapPeers(BOOTSTRAP_PEERS, LIBP2P_PORT);
 
 const DISCOVERY_INTERVAL = 60_000; // Search for peers every 60 seconds
 const PROVIDE_INTERVAL = 30 * 60_000; // Re-announce to DHT every 30 minutes
@@ -170,8 +185,11 @@ async function main() {
     connectionEncrypters: [noise()],
     streamMuxers: [yamux()],
     peerDiscovery: [
-      mdns(),
-      bootstrap({ list: [...IPFS_BOOTSTRAP_NODES, ...WESENSE_BOOTSTRAP_PEERS] }),
+      // Use a non-standard mDNS port to avoid conflict with avahi-daemon
+      // (or other host mDNS services) which exclusively bind port 5353.
+      // All WeSense stations use the same port so they discover each other.
+      mdns({ port: 5354 }),
+      bootstrap({ list: IPFS_BOOTSTRAP_NODES }),
     ],
     services: {
       identify: identify(),
@@ -184,8 +202,8 @@ async function main() {
   const helia = await createHelia({ libp2p, blockstore, datastore });
   console.log(`Helia peer ID: ${helia.libp2p.peerId.toString()}`);
   console.log(`Announced addresses: ${helia.libp2p.getMultiaddrs().map((a) => a.toString()).join(", ")}`);
-  if (WESENSE_BOOTSTRAP_PEERS.length > 0) {
-    console.log(`Bootstrap peers: ${WESENSE_BOOTSTRAP_PEERS.join(", ")}`);
+  if (WESENSE_PEER_ADDRS.length > 0) {
+    console.log(`Configured peer addresses: ${WESENSE_PEER_ADDRS.join(", ")}`);
   }
 
   // Log peer connections and disconnections
@@ -250,6 +268,44 @@ async function main() {
     if (peerCount === 0) return;
     await triggerSync(`periodic, ${peerCount} peers`);
   }, 5 * 60_000);
+
+  // Direct peer dialing — for configured WeSense station addresses.
+  // Handles environments where mDNS doesn't work (Docker on TrueNAS, VMs).
+  // Accepts simple IPs, IP:port, or full multiaddrs via ORBITDB_BOOTSTRAP_PEERS.
+  if (WESENSE_PEER_ADDRS.length > 0) {
+    const { multiaddr: createMa } = await import("@multiformats/multiaddr");
+
+    const dialConfiguredPeers = async () => {
+      for (const addr of WESENSE_PEER_ADDRS) {
+        // Skip if already connected to a peer at this address
+        const targetIp = addr.match(/\/ip4\/([^/]+)\//)?.[1];
+        if (targetIp) {
+          const alreadyConnected = helia.libp2p
+            .getConnections()
+            .some((c) => c.remoteAddr.toString().includes(targetIp));
+          if (alreadyConnected) continue;
+        }
+
+        try {
+          const ma = createMa(addr);
+          await helia.libp2p.dial(ma);
+          console.log(`Direct dial: Connected to ${addr}`);
+        } catch (err) {
+          // "dial self" is normal when the same ORBITDB_BOOTSTRAP_PEERS is
+          // used across all stations — silently skip.
+          if (!err.message?.includes("dial self")) {
+            console.warn(`Direct dial: Failed ${addr}: ${err.message}`);
+          }
+        }
+      }
+    };
+
+    // Initial dial after libp2p settles
+    setTimeout(dialConfiguredPeers, 5_000);
+    // Periodic re-dial to handle reconnection after transient failures
+    setInterval(dialConfiguredPeers, 60_000);
+    console.log(`Direct peer dialing enabled for: ${WESENSE_PEER_ADDRS.join(", ")}`);
+  }
 
   // Start DHT-based peer discovery for cross-station replication
   startPeerDiscovery(helia, dbs);
