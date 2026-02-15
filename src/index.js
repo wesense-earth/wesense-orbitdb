@@ -184,6 +184,12 @@ async function main() {
     transports: [tcp()],
     connectionEncrypters: [noise()],
     streamMuxers: [yamux()],
+    transportManager: {
+      // Don't crash if a listen address is temporarily in use (e.g. previous
+      // container still releasing port 4002 during restart). The service can
+      // still dial out; incoming connections resume on the next restart.
+      faultTolerance: 1, // NO_FATAL
+    },
     peerDiscovery: [
       // Use a non-standard mDNS port to avoid conflict with avahi-daemon
       // (or other host mDNS services) which exclusively bind port 5353.
