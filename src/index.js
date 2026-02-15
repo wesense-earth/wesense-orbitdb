@@ -166,9 +166,10 @@ async function main() {
   const blockstore = new FsBlockstore(`${DATA_DIR}/blockstore`);
   const datastore = new FsDatastore(`${DATA_DIR}/datastore`);
 
-  // Announce the host's real IP so peers on other Docker hosts can reach us
+  // Announce the host's real IP/hostname so peers on other Docker hosts can reach us
+  const announceProto = ANNOUNCE_ADDRESS && /^[\d.]+$/.test(ANNOUNCE_ADDRESS) ? "ip4" : "dns4";
   const announce = ANNOUNCE_ADDRESS
-    ? [`/ip4/${ANNOUNCE_ADDRESS}/tcp/${LIBP2P_PORT}`]
+    ? [`/${announceProto}/${ANNOUNCE_ADDRESS}/tcp/${LIBP2P_PORT}`]
     : [];
 
   // Use a dedicated datastore for libp2p so identity keys are persisted
