@@ -204,6 +204,53 @@ async function main() {
   const dbs = await openDatabases(orbitdb);
   console.log(`Databases opened — nodes: ${dbs.nodes.address}, trust: ${dbs.trust.address}`);
 
+  // Database replication event logging
+  for (const [name, db] of Object.entries(dbs)) {
+    db.events.on("join", (peerId, heads) => {
+      console.log(`[${name}] Peer joined DB: ${peerId} (${heads?.length || 0} heads)`);
+    });
+    db.events.on("update", (entry) => {
+      console.log(`[${name}] Replicated update from peer`);
+    });
+  }
+
+  // Replication trigger — when a new WeSense peer connects, write a sync
+  // marker to force HEAD re-publication via gossipsub.  This ensures peers
+  // that connect after the initial HEAD publish still receive all updates.
+  let lastSyncTrigger = 0;
+  const SYNC_DEBOUNCE = 30_000; // Max once per 30 seconds
+
+  const triggerSync = async (reason) => {
+    try {
+      const marker = {
+        _id: "__sync__",
+        type: "replication_trigger",
+        peer_id: helia.libp2p.peerId.toString(),
+        timestamp: new Date().toISOString(),
+      };
+      await dbs.nodes.put(marker);
+      await dbs.trust.put(marker);
+      console.log(`Replication sync triggered (${reason})`);
+    } catch (err) {
+      console.warn(`Sync trigger error: ${err.message}`);
+    }
+  };
+
+  helia.libp2p.addEventListener("peer:connect", () => {
+    const now = Date.now();
+    if (now - lastSyncTrigger < SYNC_DEBOUNCE) return;
+    lastSyncTrigger = now;
+    // Delay to let gossipsub mesh establish for the OrbitDB topics
+    setTimeout(() => triggerSync("peer:connect"), 5000);
+  });
+
+  // Periodic fallback — re-trigger every 5 minutes if peers are connected
+  setInterval(async () => {
+    const peerCount = helia.libp2p.getPeers().length;
+    if (peerCount === 0) return;
+    await triggerSync(`periodic, ${peerCount} peers`);
+  }, 5 * 60_000);
+
   // Start DHT-based peer discovery for cross-station replication
   startPeerDiscovery(helia, dbs);
 

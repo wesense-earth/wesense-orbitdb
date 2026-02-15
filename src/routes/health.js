@@ -16,13 +16,24 @@ export function createHealthRouter({ helia, dbs }) {
     try {
       const peers = helia.libp2p.getPeers();
 
-      // Count documents in each database
-      const nodesAll = await dbs.nodes.all();
-      const trustAll = await dbs.trust.all();
-      const attestAll = await dbs.attestations.all();
+      // Count documents in each database (exclude internal markers)
+      const nodesAll = (await dbs.nodes.all()).filter((e) => !e.value._id.startsWith("__"));
+      const trustAll = (await dbs.trust.all()).filter((e) => !e.value._id.startsWith("__"));
+      const attestAll = (await dbs.attestations.all()).filter((e) => !e.value._id.startsWith("__"));
 
       // Get announced/listen addresses for debugging connectivity
       const addrs = helia.libp2p.getMultiaddrs().map((a) => a.toString());
+
+      // Gossipsub topic diagnostics — shows which peers share OrbitDB topics
+      const pubsub = helia.libp2p.services.pubsub;
+      const topics = pubsub.getTopics ? pubsub.getTopics() : [];
+      const topicPeers = {};
+      for (const topic of topics) {
+        const subs = pubsub.getSubscribers ? pubsub.getSubscribers(topic) : [];
+        if (subs.length > 0) {
+          topicPeers[topic] = subs.map((p) => p.toString());
+        }
+      }
 
       res.json({
         status: "ok",
@@ -40,6 +51,7 @@ export function createHealthRouter({ helia, dbs }) {
           trust: dbs.trust.address.toString(),
           attestations: dbs.attestations.address.toString(),
         },
+        gossipsub_topics: topicPeers,
       });
     } catch (err) {
       console.error("GET /health error:", err);

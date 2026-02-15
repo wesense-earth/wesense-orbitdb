@@ -37,7 +37,8 @@ export function createNodesRouter(nodesDb) {
   router.get("/", async (req, res) => {
     try {
       const all = await nodesDb.all();
-      let nodes = all.map((entry) => entry.value);
+      let nodes = all.map((entry) => entry.value)
+        .filter((n) => !n._id.startsWith("__"));
 
       // Optional country filter
       if (req.query.country) {
