@@ -344,6 +344,7 @@ async function main() {
 
   // Retry listen — with network_mode: host the previous container may not
   // have fully released the port yet during a restart.
+  let httpServer = null;
   const startServer = (retries = 5, delay = 2000) => {
     const server = app.listen(PORT, () => {
       console.log(`HTTP API listening on port ${PORT}`);
@@ -356,17 +357,35 @@ async function main() {
         throw err;
       }
     });
+    httpServer = server;
   };
   startServer();
 
-  // Graceful shutdown
+  // Graceful shutdown — force-exit after 8 seconds to stay within Docker's
+  // 10-second SIGTERM grace period. Without this, helia.stop() can hang
+  // indefinitely waiting on DHT/peer operations, leaving zombie processes.
+  let shuttingDown = false;
   const shutdown = async () => {
+    if (shuttingDown) return; // Prevent double-shutdown from SIGINT + SIGTERM
+    shuttingDown = true;
     console.log("Shutting down...");
-    await dbs.nodes.close();
-    await dbs.trust.close();
-    await dbs.attestations.close();
-    await orbitdb.stop();
-    await helia.stop();
+
+    const forceExit = setTimeout(() => {
+      console.warn("Graceful shutdown timed out, forcing exit");
+      process.exit(1);
+    }, 8000);
+    forceExit.unref(); // Don't let the timer itself keep the process alive
+
+    try {
+      if (httpServer) httpServer.close();
+      await dbs.nodes.close();
+      await dbs.trust.close();
+      await dbs.attestations.close();
+      await orbitdb.stop();
+      await helia.stop();
+    } catch (err) {
+      console.warn(`Shutdown error: ${err.message}`);
+    }
     process.exit(0);
   };
   process.on("SIGINT", shutdown);
