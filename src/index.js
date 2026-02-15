@@ -41,6 +41,7 @@ const LIBP2P_PORT = parseInt(process.env.LIBP2P_PORT || "4002", 10);
 const DATA_DIR = process.env.DATA_DIR || "./data";
 const ANNOUNCE_ADDRESS = process.env.ANNOUNCE_ADDRESS || "";
 const BOOTSTRAP_PEERS = process.env.ORBITDB_BOOTSTRAP_PEERS || "";
+const NODE_TTL_DAYS = parseInt(process.env.NODE_TTL_DAYS || "7", 10);
 
 // Public IPFS bootstrap nodes (from Helia/kubo defaults).
 // These are the entry points into the IPFS DHT.
@@ -291,6 +292,33 @@ async function main() {
     if (peerCount === 0) return;
     await triggerSync(`periodic, ${peerCount} peers`);
   }, 5 * 60_000);
+
+  // Node registry cleanup — remove entries not updated within NODE_TTL_DAYS.
+  // Runs every hour. Deleted entries replicate the deletion to other peers.
+  const cleanupStaleNodes = async () => {
+    try {
+      const cutoff = Date.now() - NODE_TTL_DAYS * 24 * 60 * 60 * 1000;
+      const allEntries = await dbs.nodes.all();
+      let removed = 0;
+      for (const entry of allEntries) {
+        const doc = entry.value;
+        if (!doc || doc._id?.startsWith("__")) continue;
+        const updatedAt = doc.updated_at ? new Date(doc.updated_at).getTime() : 0;
+        if (updatedAt < cutoff) {
+          await dbs.nodes.del(doc._id);
+          removed++;
+        }
+      }
+      if (removed > 0) {
+        console.log(`Node cleanup: removed ${removed} stale entries (TTL: ${NODE_TTL_DAYS}d)`);
+      }
+    } catch (err) {
+      console.warn(`Node cleanup error: ${err.message}`);
+    }
+  };
+  // Run on startup after a delay, then every hour
+  setTimeout(cleanupStaleNodes, 30_000);
+  setInterval(cleanupStaleNodes, 60 * 60_000);
 
   // Direct peer dialing — for configured WeSense station addresses.
   // Handles environments where mDNS doesn't work (Docker on TrueNAS, VMs).
