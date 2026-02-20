@@ -28,13 +28,15 @@ import { createOrbitDB } from "@orbitdb/core";
 import { CID } from "multiformats/cid";
 import { base58btc } from "multiformats/bases/base58";
 import express from "express";
-import { mkdir } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 
 import { openDatabases } from "./databases.js";
 import { createNodesRouter } from "./routes/nodes.js";
 import { createTrustRouter } from "./routes/trust.js";
 import { createAttestationsRouter } from "./routes/attestations.js";
 import { createHealthRouter } from "./routes/health.js";
+import { createArchivesRouter } from "./routes/archives.js";
+import { createIPFSTree } from "./ipfs-tree.js";
 
 const PORT = parseInt(process.env.PORT || "5200", 10);
 const LIBP2P_PORT = parseInt(process.env.LIBP2P_PORT || "4002", 10);
@@ -368,6 +370,59 @@ async function main() {
   // Start DHT-based peer discovery for cross-station replication
   startPeerDiscovery(helia, dbs);
 
+  // IPFS archive tree — manages the browsable directory structure on IPFS
+  const ipfsTree = createIPFSTree(helia);
+
+  // Ensure staging directory exists (shared volume with archiver)
+  const archiveStagingDir = process.env.ARCHIVE_STAGING_DIR || `${DATA_DIR}/staging`;
+  await mkdir(archiveStagingDir, { recursive: true });
+
+  // Load persisted root CID if it exists
+  const rootCidPath = `${DATA_DIR}/archive_root_cid.json`;
+  try {
+    const saved = JSON.parse(await readFile(rootCidPath, "utf-8"));
+    if (saved.root_cid) {
+      ipfsTree.setRootCid(saved.root_cid);
+      console.log(`Loaded archive tree root CID: ${saved.root_cid}`);
+    }
+  } catch {
+    // No persisted root — first run or reset
+  }
+
+  // IPNS publish/resolve helpers using Helia's libp2p peer key
+  let ipnsPublish = null;
+  let ipnsResolve = null;
+  try {
+    const { ipns: createIPNS } = await import("@helia/ipns");
+    const ipnsInstance = createIPNS(helia);
+
+    ipnsPublish = async (cid) => {
+      const peerId = helia.libp2p.peerId;
+      await ipnsInstance.publish(peerId, cid);
+      const name = peerId.toString();
+      console.log(`IPNS published: ${name} -> ${cid.toString()}`);
+
+      // Persist root CID to disk for recovery after restart
+      await writeFile(rootCidPath, JSON.stringify({ root_cid: cid.toString() }));
+
+      return name;
+    };
+
+    ipnsResolve = async () => {
+      const peerId = helia.libp2p.peerId;
+      const result = await ipnsInstance.resolve(peerId, {
+        signal: AbortSignal.timeout(10_000),
+      });
+      return {
+        name: peerId.toString(),
+        cid: result.cid.toString(),
+      };
+    };
+    console.log("IPNS publish/resolve initialized");
+  } catch (err) {
+    console.warn(`IPNS initialization skipped: ${err.message}`);
+  }
+
   // Express HTTP API
   const app = express();
   app.use(express.json());
@@ -376,6 +431,7 @@ async function main() {
   app.use("/trust", createTrustRouter(dbs.trust));
   app.use("/attestations", createAttestationsRouter(dbs.attestations));
   app.use("/health", createHealthRouter({ helia, dbs }));
+  app.use("/archives", createArchivesRouter({ ipfsTree, helia, ipnsPublish, ipnsResolve }));
 
   // Retry listen — with network_mode: host the previous container may not
   // have fully released the port yet during a restart.
