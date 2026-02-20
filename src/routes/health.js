@@ -24,20 +24,27 @@ export function createHealthRouter({ helia, dbs }) {
       // Get announced/listen addresses for debugging connectivity
       const addrs = helia.libp2p.getMultiaddrs().map((a) => a.toString());
 
-      // Gossipsub topic diagnostics — shows which peers share OrbitDB topics
+      // Gossipsub topic diagnostics — shows which peers share OrbitDB topics.
+      // Peers subscribed to OrbitDB database topics are other WeSense stations
+      // (not IPFS bootstrap relays or transient DHT peers).
       const pubsub = helia.libp2p.services.pubsub;
       const topics = pubsub.getTopics ? pubsub.getTopics() : [];
       const topicPeers = {};
+      const wesensePeerSet = new Set();
       for (const topic of topics) {
         const subs = pubsub.getSubscribers ? pubsub.getSubscribers(topic) : [];
         if (subs.length > 0) {
           topicPeers[topic] = subs.map((p) => p.toString());
+          for (const p of subs) wesensePeerSet.add(p.toString());
         }
       }
+      const wesensePeers = [...wesensePeerSet];
 
       res.json({
         status: "ok",
         peer_count: peers.length,
+        wesense_peer_count: wesensePeers.length,
+        wesense_peers: wesensePeers,
         peers: peers.map((p) => p.toString()),
         libp2p_peer_id: helia.libp2p.peerId.toString(),
         addresses: addrs,
