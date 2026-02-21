@@ -384,6 +384,12 @@ async function main() {
     if (saved.root_cid) {
       ipfsTree.setRootCid(saved.root_cid);
       console.log(`Loaded archive tree root CID: ${saved.root_cid}`);
+      // Announce to DHT so the content is discoverable after restart
+      const savedCid = ipfsTree.getRootCid();
+      helia.routing.provide(savedCid, { signal: AbortSignal.timeout(30_000) }).then(
+        () => console.log(`DHT: Re-provided archive root CID ${saved.root_cid}`),
+        (err) => console.warn(`DHT provide for archive root failed: ${err.message}`)
+      );
     }
   } catch {
     // No persisted root — first run or reset
