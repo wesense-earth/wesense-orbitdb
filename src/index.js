@@ -129,13 +129,13 @@ function startPeerDiscovery(helia, dbs) {
         if (provider.id.equals(myPeerId)) continue;
         if (connectedPeers.has(provider.id.toString())) continue;
 
-        // Filter to TCP-dialable addresses only (skip HTTP gateways, QUIC, etc.)
-        const tcpAddrs = (provider.multiaddrs || []).filter((a) =>
-          a.toString().includes("/tcp/")
-        );
-        if (tcpAddrs.length === 0) continue; // No dialable addresses
-
-        console.log(`DHT: Discovered peer ${provider.id} addrs=[${tcpAddrs.map((a) => a.toString()).join(", ")}]`);
+        // Filter to raw TCP addresses only — skip HTTP gateways (/tls/http),
+        // QUIC, WebSocket, and peers with no addresses at all.
+        const tcpAddrs = (provider.multiaddrs || []).filter((a) => {
+          const s = a.toString();
+          return s.includes("/tcp/") && !s.includes("/tls/") && !s.includes("/ws") && !s.includes("/http");
+        });
+        if (tcpAddrs.length === 0) continue;
 
         try {
           await helia.libp2p.peerStore.merge(provider.id, {
@@ -144,7 +144,10 @@ function startPeerDiscovery(helia, dbs) {
           await helia.libp2p.dial(provider.id);
           console.log(`DHT: Connected to peer ${provider.id}`);
         } catch (err) {
-          console.warn(`DHT: Failed to dial ${provider.id}: ${err.message}`);
+          // Only log if not a common transient failure
+          if (!err.message?.includes("no valid addresses")) {
+            console.warn(`DHT: Failed to dial ${provider.id}: ${err.message}`);
+          }
         }
       }
     } catch {
@@ -249,12 +252,21 @@ async function main() {
     );
   });
 
-  // Log peer connections and disconnections
+  // Log peer connections and disconnections (suppress IPFS bootstrap churn)
+  const ipfsBootstrapIds = new Set(
+    IPFS_BOOTSTRAP_NODES.map((a) => a.split("/p2p/")[1]).filter(Boolean)
+  );
   helia.libp2p.addEventListener("peer:connect", (evt) => {
-    console.log(`Peer connected: ${evt.detail.toString()}`);
+    const id = evt.detail.toString();
+    if (!ipfsBootstrapIds.has(id)) {
+      console.log(`Peer connected: ${id}`);
+    }
   });
   helia.libp2p.addEventListener("peer:disconnect", (evt) => {
-    console.log(`Peer disconnected: ${evt.detail.toString()}`);
+    const id = evt.detail.toString();
+    if (!ipfsBootstrapIds.has(id)) {
+      console.log(`Peer disconnected: ${id}`);
+    }
   });
 
   const orbitdb = await createOrbitDB({
@@ -310,12 +322,18 @@ async function main() {
   helia.libp2p.addEventListener("peer:connect", (evt) => {
     const now = Date.now();
     if (now - lastSyncTrigger < SYNC_DEBOUNCE) return;
+    // Claim the debounce slot immediately to prevent multiple setTimeouts
+    lastSyncTrigger = now;
     // Delay to let gossipsub subscriptions propagate, then check if
-    // the new peer is actually a WeSense station (topic subscriber)
+    // any WeSense station is connected (topic subscriber)
     setTimeout(() => {
       const wesensePeers = getWesensePeerCount();
-      if (wesensePeers === 0) return; // Just an IPFS peer, skip
-      lastSyncTrigger = Date.now();
+      if (wesensePeers === 0) {
+        // Reset debounce — this was just an IPFS peer, don't block
+        // the next real WeSense peer from triggering sync
+        lastSyncTrigger = 0;
+        return;
+      }
       triggerSync(`wesense peer:connect, ${wesensePeers} WeSense peers`);
     }, 10_000);
   });
