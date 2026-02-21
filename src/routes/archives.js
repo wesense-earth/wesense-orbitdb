@@ -30,6 +30,14 @@ export function createArchivesRouter({ ipfsTree, helia, ipnsPublish, ipnsResolve
         await persistRootCid(result.rootCid);
       }
 
+      // Announce root CID to IPFS DHT so other nodes can discover the content
+      try {
+        await helia.routing.provide(result.rootCid, { signal: AbortSignal.timeout(30_000) });
+        console.log(`DHT: Provided archive root CID ${result.rootCid}`);
+      } catch (err) {
+        console.warn(`DHT provide for archive root failed: ${err.message}`);
+      }
+
       // Publish updated root CID to IPNS
       let ipnsName = null;
       if (ipnsPublish) {
