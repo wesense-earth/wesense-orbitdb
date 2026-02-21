@@ -144,8 +144,8 @@ function startPeerDiscovery(helia, dbs) {
           await helia.libp2p.dial(provider.id);
           console.log(`DHT: Connected to peer ${provider.id}`);
         } catch (err) {
-          // Only log if not a common transient failure
-          if (!err.message?.includes("no valid addresses")) {
+          // Only log unexpected failures (not self-dial or missing addresses)
+          if (!err.message?.includes("no valid addresses") && !err.message?.includes("dial self")) {
             console.warn(`DHT: Failed to dial ${provider.id}: ${err.message}`);
           }
         }
@@ -319,21 +319,19 @@ async function main() {
     }
   };
 
-  helia.libp2p.addEventListener("peer:connect", (evt) => {
+  let syncPending = false;
+  helia.libp2p.addEventListener("peer:connect", () => {
+    if (syncPending) return;
     const now = Date.now();
     if (now - lastSyncTrigger < SYNC_DEBOUNCE) return;
-    // Claim the debounce slot immediately to prevent multiple setTimeouts
-    lastSyncTrigger = now;
+    syncPending = true;
     // Delay to let gossipsub subscriptions propagate, then check if
     // any WeSense station is connected (topic subscriber)
     setTimeout(() => {
+      syncPending = false;
       const wesensePeers = getWesensePeerCount();
-      if (wesensePeers === 0) {
-        // Reset debounce — this was just an IPFS peer, don't block
-        // the next real WeSense peer from triggering sync
-        lastSyncTrigger = 0;
-        return;
-      }
+      if (wesensePeers === 0) return;
+      lastSyncTrigger = Date.now();
       triggerSync(`wesense peer:connect, ${wesensePeers} WeSense peers`);
     }, 10_000);
   });
