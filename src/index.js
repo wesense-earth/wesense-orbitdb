@@ -390,15 +390,21 @@ async function main() {
   }
 
   // IPNS publish/resolve helpers using Helia's libp2p peer key
+  // @helia/ipns v8+ requires a PrivateKey for publish (not PeerId)
   let ipnsPublish = null;
   let ipnsResolve = null;
   try {
     const { ipns: createIPNS } = await import("@helia/ipns");
     const ipnsInstance = createIPNS(helia);
+    const peerId = helia.libp2p.peerId;
+    const privateKey = helia.libp2p.privateKey;
+
+    if (!privateKey) {
+      throw new Error("Private key not available from libp2p node");
+    }
 
     ipnsPublish = async (cid) => {
-      const peerId = helia.libp2p.peerId;
-      await ipnsInstance.publish(peerId, cid);
+      await ipnsInstance.publish(privateKey, cid);
       const name = peerId.toString();
       console.log(`IPNS published: ${name} -> ${cid.toString()}`);
 
@@ -409,7 +415,6 @@ async function main() {
     };
 
     ipnsResolve = async () => {
-      const peerId = helia.libp2p.peerId;
       const result = await ipnsInstance.resolve(peerId, {
         signal: AbortSignal.timeout(10_000),
       });
