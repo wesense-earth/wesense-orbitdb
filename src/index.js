@@ -407,10 +407,6 @@ async function main() {
       await ipnsInstance.publish(privateKey, cid);
       const name = peerId.toString();
       console.log(`IPNS published: ${name} -> ${cid.toString()}`);
-
-      // Persist root CID to disk for recovery after restart
-      await writeFile(rootCidPath, JSON.stringify({ root_cid: cid.toString() }));
-
       return name;
     };
 
@@ -436,7 +432,12 @@ async function main() {
   app.use("/trust", createTrustRouter(dbs.trust));
   app.use("/attestations", createAttestationsRouter(dbs.attestations));
   app.use("/health", createHealthRouter({ helia, dbs }));
-  app.use("/archives", createArchivesRouter({ ipfsTree, helia, ipnsPublish, ipnsResolve }));
+  // Persist root CID to disk after every successful archive operation (independent of IPNS)
+  const persistRootCid = async (cid) => {
+    await writeFile(rootCidPath, JSON.stringify({ root_cid: cid.toString() }));
+  };
+
+  app.use("/archives", createArchivesRouter({ ipfsTree, helia, ipnsPublish, ipnsResolve, persistRootCid }));
 
   // Retry listen — with network_mode: host the previous container may not
   // have fully released the port yet during a restart.
