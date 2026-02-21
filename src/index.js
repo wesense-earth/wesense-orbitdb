@@ -45,14 +45,11 @@ const ANNOUNCE_ADDRESS = process.env.ANNOUNCE_ADDRESS || "";
 const BOOTSTRAP_PEERS = process.env.ORBITDB_BOOTSTRAP_PEERS || "";
 const NODE_TTL_DAYS = parseInt(process.env.NODE_TTL_DAYS || "7", 10);
 
-// Public IPFS bootstrap nodes (from Helia/kubo defaults).
-// These are the entry points into the IPFS DHT.
+// Public IPFS bootstrap nodes — entry points into the IPFS DHT.
+// Two is enough for DHT connectivity; more causes unnecessary connection churn.
 const IPFS_BOOTSTRAP_NODES = [
   "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
   "/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
-  "/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
-  "/dnsaddr/va1.bootstrap.libp2p.io/p2p/12D3KooWKnDdG3iXw9eTFijk3EWSunZcFi54Zka4wmtqtt6rPxc8",
-  "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
 ];
 
 // Parse ORBITDB_BOOTSTRAP_PEERS — supports multiple formats:
@@ -119,6 +116,17 @@ function startPeerDiscovery(helia, dbs) {
     const myPeerId = helia.libp2p.peerId;
     const connectedPeers = new Set(helia.libp2p.getPeers().map((p) => p.toString()));
 
+    // Collect our own addresses so we can skip stale DHT records that
+    // point to us under an old peer ID (prevents "Can not dial self").
+    const myAddrs = new Set(
+      helia.libp2p.getMultiaddrs().map((a) => {
+        // Strip the /p2p/... suffix to match on IP:port only
+        const s = a.toString();
+        const idx = s.indexOf("/p2p/");
+        return idx >= 0 ? s.substring(0, idx) : s;
+      })
+    );
+
     // Only need to search one database CID — all stations provide all three,
     // so finding a provider for one means we'll connect and replicate all.
     const cid = dbCids[0];
@@ -137,6 +145,16 @@ function startPeerDiscovery(helia, dbs) {
         });
         if (tcpAddrs.length === 0) continue;
 
+        // Skip providers whose addresses match our own (stale DHT records
+        // from before we had persistent peer IDs)
+        const isOurself = tcpAddrs.every((a) => {
+          const s = a.toString();
+          const idx = s.indexOf("/p2p/");
+          const base = idx >= 0 ? s.substring(0, idx) : s;
+          return myAddrs.has(base);
+        });
+        if (isOurself) continue;
+
         try {
           await helia.libp2p.peerStore.merge(provider.id, {
             multiaddrs: tcpAddrs,
@@ -144,10 +162,7 @@ function startPeerDiscovery(helia, dbs) {
           await helia.libp2p.dial(provider.id);
           console.log(`DHT: Connected to peer ${provider.id}`);
         } catch (err) {
-          // Only log unexpected failures (not self-dial or missing addresses)
-          if (!err.message?.includes("no valid addresses") && !err.message?.includes("dial self")) {
-            console.warn(`DHT: Failed to dial ${provider.id}: ${err.message}`);
-          }
+          console.warn(`DHT: Failed to dial ${provider.id}: ${err.message}`);
         }
       }
     } catch {
@@ -252,21 +267,12 @@ async function main() {
     );
   });
 
-  // Log peer connections and disconnections (suppress IPFS bootstrap churn)
-  const ipfsBootstrapIds = new Set(
-    IPFS_BOOTSTRAP_NODES.map((a) => a.split("/p2p/")[1]).filter(Boolean)
-  );
+  // Log peer connections and disconnections
   helia.libp2p.addEventListener("peer:connect", (evt) => {
-    const id = evt.detail.toString();
-    if (!ipfsBootstrapIds.has(id)) {
-      console.log(`Peer connected: ${id}`);
-    }
+    console.log(`Peer connected: ${evt.detail.toString()}`);
   });
   helia.libp2p.addEventListener("peer:disconnect", (evt) => {
-    const id = evt.detail.toString();
-    if (!ipfsBootstrapIds.has(id)) {
-      console.log(`Peer disconnected: ${id}`);
-    }
+    console.log(`Peer disconnected: ${evt.detail.toString()}`);
   });
 
   const orbitdb = await createOrbitDB({
