@@ -129,16 +129,18 @@ function startPeerDiscovery(helia, dbs) {
         if (provider.id.equals(myPeerId)) continue;
         if (connectedPeers.has(provider.id.toString())) continue;
 
-        const addrs = (provider.multiaddrs || []).map((a) => a.toString());
-        console.log(`DHT: Discovered peer ${provider.id} addrs=[${addrs.join(", ")}]`);
+        // Filter to TCP-dialable addresses only (skip HTTP gateways, QUIC, etc.)
+        const tcpAddrs = (provider.multiaddrs || []).filter((a) =>
+          a.toString().includes("/tcp/")
+        );
+        if (tcpAddrs.length === 0) continue; // No dialable addresses
+
+        console.log(`DHT: Discovered peer ${provider.id} addrs=[${tcpAddrs.map((a) => a.toString()).join(", ")}]`);
 
         try {
-          if (addrs.length > 0) {
-            // Store the provider's addresses before dialing
-            await helia.libp2p.peerStore.merge(provider.id, {
-              multiaddrs: provider.multiaddrs,
-            });
-          }
+          await helia.libp2p.peerStore.merge(provider.id, {
+            multiaddrs: tcpAddrs,
+          });
           await helia.libp2p.dial(provider.id);
           console.log(`DHT: Connected to peer ${provider.id}`);
         } catch (err) {
@@ -199,6 +201,14 @@ async function main() {
       // container still releasing port 4002 during restart). The service can
       // still dial out; incoming connections resume on the next restart.
       faultTolerance: 1, // NO_FATAL
+    },
+    connectionManager: {
+      // Keep connection count low to avoid event-loop starvation from
+      // constant IPFS peer churn (connect/disconnect/identify cycles).
+      // WeSense only needs a handful of peers for OrbitDB replication +
+      // enough DHT connections for content routing.
+      minConnections: 3,
+      maxConnections: 20,
     },
     peerDiscovery: [
       // Use a non-standard mDNS port to avoid conflict with avahi-daemon
