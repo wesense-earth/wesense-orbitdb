@@ -50,6 +50,11 @@ export function createIPFSTree(helia) {
     if (pathParts.length === 1) {
       // Leaf: add file, then link into directory
       const fileCid = await fs.addBytes(content);
+      try {
+        dirCid = await fs.rm(dirCid, pathParts[0]);
+      } catch {
+        // Didn't exist — fine
+      }
       return fs.cp(fileCid, dirCid, pathParts[0]);
     }
 
