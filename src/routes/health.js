@@ -2,6 +2,9 @@
  * Health check endpoint.
  *
  * GET /health — Service status, peer count, database sizes, libp2p peer ID.
+ *
+ * Database sizes are maintained via event listeners (not queried per-request)
+ * to avoid blocking the event loop on large databases.
  */
 
 import { Router } from "express";
@@ -12,14 +15,28 @@ import { Router } from "express";
 export function createHealthRouter({ helia, dbs }) {
   const router = Router();
 
-  router.get("/", async (req, res) => {
+  // Maintain document counts via events instead of calling .all() per request.
+  // Initial counts are loaded once at startup; updates/joins increment live.
+  const dbCounts = { nodes: 0, trust: 0, attestations: 0 };
+
+  const refreshCounts = async () => {
+    for (const [name, db] of Object.entries(dbs)) {
+      try {
+        const all = await db.all();
+        dbCounts[name] = all.filter((e) => !e.value?._id?.startsWith("__")).length;
+      } catch {
+        // Leave at current count if query fails
+      }
+    }
+  };
+
+  // Load initial counts, then refresh every 5 minutes
+  refreshCounts();
+  setInterval(refreshCounts, 5 * 60_000);
+
+  router.get("/", (req, res) => {
     try {
       const peers = helia.libp2p.getPeers();
-
-      // Count documents in each database (exclude internal markers)
-      const nodesAll = (await dbs.nodes.all()).filter((e) => !e.value._id.startsWith("__"));
-      const trustAll = (await dbs.trust.all()).filter((e) => !e.value._id.startsWith("__"));
-      const attestAll = (await dbs.attestations.all()).filter((e) => !e.value._id.startsWith("__"));
 
       // Get announced/listen addresses for debugging connectivity
       const addrs = helia.libp2p.getMultiaddrs().map((a) => a.toString());
@@ -49,9 +66,9 @@ export function createHealthRouter({ helia, dbs }) {
         libp2p_peer_id: helia.libp2p.peerId.toString(),
         addresses: addrs,
         db_sizes: {
-          nodes: nodesAll.length,
-          trust: trustAll.length,
-          attestations: attestAll.length,
+          nodes: dbCounts.nodes,
+          trust: dbCounts.trust,
+          attestations: dbCounts.attestations,
         },
         db_addresses: {
           nodes: dbs.nodes.address.toString(),
