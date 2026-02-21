@@ -39,7 +39,7 @@ import { createArchivesRouter } from "./routes/archives.js";
 import { createIPFSTree } from "./ipfs-tree.js";
 
 const PORT = parseInt(process.env.PORT || "5200", 10);
-const LIBP2P_PORT = parseInt(process.env.LIBP2P_PORT || "4002", 10);
+const LIBP2P_PORT = parseInt(process.env.LIBP2P_PORT || "4001", 10);
 const DATA_DIR = process.env.DATA_DIR || "./data";
 const ANNOUNCE_ADDRESS = process.env.ANNOUNCE_ADDRESS || "";
 const BOOTSTRAP_PEERS = process.env.ORBITDB_BOOTSTRAP_PEERS || "";
@@ -60,11 +60,11 @@ const IPFS_BOOTSTRAP_NODES = ALL_IPFS_BOOTSTRAP_NODES
   .slice(0, 2);
 
 // Parse ORBITDB_BOOTSTRAP_PEERS — supports multiple formats:
-//   Full multiaddr: /ip4/203.0.113.1/tcp/4002/p2p/12D3KooW...
-//   IP:port:        203.0.113.1:4002
+//   Full multiaddr: /ip4/203.0.113.1/tcp/4001/p2p/12D3KooW...
+//   IP:port:        203.0.113.1:4001
 //   Just IP:        203.0.113.1  (uses LIBP2P_PORT)
 //   Hostname:       bootstrap.wesense.earth  (uses /dns4/)
-//   Hostname:port:  bootstrap.wesense.earth:4002
+//   Hostname:port:  bootstrap.wesense.earth:4001
 function parseBootstrapPeers(peersStr, defaultPort) {
   if (!peersStr) return [];
   return peersStr
@@ -87,7 +87,7 @@ function parseBootstrapPeers(peersStr, defaultPort) {
 
 const WESENSE_PEER_ADDRS = parseBootstrapPeers(BOOTSTRAP_PEERS, LIBP2P_PORT);
 
-const DISCOVERY_INTERVAL = 60_000; // Search for peers every 60 seconds
+const DISCOVERY_INTERVAL = 5 * 60_000; // Search for peers every 5 minutes
 const PROVIDE_INTERVAL = 30 * 60_000; // Re-announce to DHT every 30 minutes
 
 /**
@@ -189,7 +189,7 @@ function startPeerDiscovery(helia, dbs) {
   // Periodic discovery
   setInterval(discover, DISCOVERY_INTERVAL);
 
-  console.log("DHT peer discovery started (provide + find every 60s)");
+  console.log("DHT peer discovery started (provide every 30m, find every 5m)");
 }
 
 async function main() {
@@ -223,7 +223,7 @@ async function main() {
     streamMuxers: [yamux()],
     transportManager: {
       // Don't crash if a listen address is temporarily in use (e.g. previous
-      // container still releasing port 4002 during restart). The service can
+      // container still releasing port 4001 during restart). The service can
       // still dial out; incoming connections resume on the next restart.
       faultTolerance: 1, // NO_FATAL
     },
