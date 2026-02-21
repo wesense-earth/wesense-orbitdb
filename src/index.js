@@ -265,21 +265,31 @@ async function main() {
   const dbs = await openDatabases(orbitdb);
   console.log(`Databases opened — nodes: ${dbs.nodes.address}, trust: ${dbs.trust.address}`);
 
-  // Database replication event logging
+  // Database replication event logging (join only — update events are too noisy)
   for (const [name, db] of Object.entries(dbs)) {
     db.events.on("join", (peerId, heads) => {
       console.log(`[${name}] Peer joined DB: ${peerId} (${heads?.length || 0} heads)`);
     });
-    db.events.on("update", (entry) => {
-      console.log(`[${name}] Replicated update from peer`);
-    });
   }
 
-  // Replication trigger — when a new WeSense peer connects, write a sync
-  // marker to force HEAD re-publication via gossipsub.  This ensures peers
-  // that connect after the initial HEAD publish still receive all updates.
+  // Replication trigger — when a WeSense peer connects (identified by
+  // gossipsub topic subscription), write a sync marker to force HEAD
+  // re-publication.  Only fires for actual WeSense stations sharing
+  // OrbitDB databases, NOT for IPFS bootstrap/DHT peers whose constant
+  // connect/disconnect churn was saturating the event loop.
   let lastSyncTrigger = 0;
-  const SYNC_DEBOUNCE = 30_000; // Max once per 30 seconds
+  const SYNC_DEBOUNCE = 60_000; // Max once per 60 seconds
+
+  const getWesensePeerCount = () => {
+    const pubsub = helia.libp2p.services.pubsub;
+    const topics = pubsub.getTopics ? pubsub.getTopics() : [];
+    const peerSet = new Set();
+    for (const topic of topics) {
+      const subs = pubsub.getSubscribers ? pubsub.getSubscribers(topic) : [];
+      for (const p of subs) peerSet.add(p.toString());
+    }
+    return peerSet.size;
+  };
 
   const triggerSync = async (reason) => {
     try {
@@ -297,20 +307,25 @@ async function main() {
     }
   };
 
-  helia.libp2p.addEventListener("peer:connect", () => {
+  helia.libp2p.addEventListener("peer:connect", (evt) => {
     const now = Date.now();
     if (now - lastSyncTrigger < SYNC_DEBOUNCE) return;
-    lastSyncTrigger = now;
-    // Delay to let gossipsub mesh establish for the OrbitDB topics
-    setTimeout(() => triggerSync("peer:connect"), 5000);
+    // Delay to let gossipsub subscriptions propagate, then check if
+    // the new peer is actually a WeSense station (topic subscriber)
+    setTimeout(() => {
+      const wesensePeers = getWesensePeerCount();
+      if (wesensePeers === 0) return; // Just an IPFS peer, skip
+      lastSyncTrigger = Date.now();
+      triggerSync(`wesense peer:connect, ${wesensePeers} WeSense peers`);
+    }, 10_000);
   });
 
-  // Periodic fallback — re-trigger every 5 minutes if peers are connected
+  // Periodic fallback — re-trigger every 10 minutes if WeSense peers are connected
   setInterval(async () => {
-    const peerCount = helia.libp2p.getPeers().length;
-    if (peerCount === 0) return;
-    await triggerSync(`periodic, ${peerCount} peers`);
-  }, 5 * 60_000);
+    const wesensePeers = getWesensePeerCount();
+    if (wesensePeers === 0) return;
+    await triggerSync(`periodic, ${wesensePeers} WeSense peers`);
+  }, 10 * 60_000);
 
   // Node registry cleanup — remove entries not updated within NODE_TTL_DAYS.
   // Runs every hour. Deleted entries replicate the deletion to other peers.
