@@ -13,9 +13,9 @@ import { Router } from "express";
 const STAGING_DIR = process.env.ARCHIVE_STAGING_DIR || "/app/data/staging";
 
 /**
- * @param {{ipfsTree: object, helia: object, ipnsPublish: function, ipnsResolve: function}} ctx
+ * @param {{ipfsTree: object, helia: object, ipnsPublish: function, ipnsResolve: function, persistRootCid: function}} ctx
  */
-export function createArchivesRouter({ ipfsTree, helia, ipnsPublish, ipnsResolve }) {
+export function createArchivesRouter({ ipfsTree, helia, ipnsPublish, ipnsResolve, persistRootCid }) {
   const router = Router();
 
   // POST /archives — Ingest from staging directory, add to IPFS tree, publish IPNS
@@ -24,6 +24,11 @@ export function createArchivesRouter({ ipfsTree, helia, ipnsPublish, ipnsResolve
       const stagingDir = req.body.staging_dir || STAGING_DIR;
 
       const result = await ipfsTree.ingestFromStaging(stagingDir);
+
+      // Always persist root CID to disk (survives restarts even if IPNS fails)
+      if (persistRootCid) {
+        await persistRootCid(result.rootCid);
+      }
 
       // Publish updated root CID to IPNS
       let ipnsName = null;
@@ -117,6 +122,11 @@ export function createArchivesRouter({ ipfsTree, helia, ipnsPublish, ipnsResolve
       }
 
       const newRootCid = await ipfsTree.removePath(path);
+
+      // Always persist root CID to disk
+      if (persistRootCid) {
+        await persistRootCid(newRootCid);
+      }
 
       // Re-publish IPNS with updated root
       let ipnsName = null;
