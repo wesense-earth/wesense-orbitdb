@@ -225,8 +225,8 @@ async function main() {
   // Peer identity persistence — stable peer ID across restarts.
   // Critical for DHT provider records and IPNS: if the peer ID changes,
   // previous provider records become orphaned and IPNS names expire.
-  // We persist the private key to a file rather than relying on libp2p's
-  // datastore auto-persistence, which doesn't work reliably across versions.
+  // We generate/load the key BEFORE creating libp2p because the private
+  // key is not exposed on the libp2p instance after creation.
   const keyPath = `${DATA_DIR}/peer_key`;
   let privateKey;
   try {
@@ -235,7 +235,15 @@ async function main() {
     privateKey = privateKeyFromProtobuf(keyBytes);
     console.log("Loaded persisted peer identity");
   } catch (err) {
-    console.log(`Generating new peer identity (${err.code === "ENOENT" ? "first run" : err.message})`);
+    // First run or corrupted key — generate a new one and save it
+    try {
+      const { generateKeyPair, privateKeyToProtobuf } = await import("@libp2p/crypto/keys");
+      privateKey = await generateKeyPair("Ed25519");
+      await writeFile(keyPath, Buffer.from(privateKeyToProtobuf(privateKey)));
+      console.log("Generated new peer identity (saved to disk)");
+    } catch (genErr) {
+      console.warn(`Could not generate/save peer key: ${genErr.message} — peer ID will change on restart`);
+    }
   }
 
   const libp2p = await createLibp2p({
@@ -285,18 +293,6 @@ async function main() {
   });
 
   const helia = await createHelia({ libp2p, blockstore, datastore });
-
-  // Persist peer key if this is the first run (wasn't loaded from disk)
-  if (!privateKey) {
-    try {
-      const { privateKeyToProtobuf } = await import("@libp2p/crypto/keys");
-      await writeFile(keyPath, privateKeyToProtobuf(helia.libp2p.privateKey));
-      console.log("Peer identity saved to disk (will be stable across restarts)");
-    } catch (err) {
-      console.warn(`Could not persist peer key: ${err.message}`);
-    }
-  }
-
   console.log(`Helia peer ID: ${helia.libp2p.peerId.toString()}`);
   console.log(`Announced addresses: ${helia.libp2p.getMultiaddrs().map((a) => a.toString()).join(", ")}`);
   if (WESENSE_PEER_ADDRS.length > 0) {
@@ -499,10 +495,9 @@ async function main() {
     const { ipns: createIPNS } = await import("@helia/ipns");
     const ipnsInstance = createIPNS(helia);
     const peerId = helia.libp2p.peerId;
-    const privateKey = helia.libp2p.privateKey;
 
     if (!privateKey) {
-      throw new Error("Private key not available from libp2p node");
+      throw new Error("Private key not available (peer key generation failed at startup)");
     }
 
     ipnsPublish = async (cid) => {
