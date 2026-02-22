@@ -9,6 +9,8 @@
  */
 
 import { Router } from "express";
+import { unixfs } from "@helia/unixfs";
+import { CID } from "multiformats/cid";
 
 const STAGING_DIR = process.env.ARCHIVE_STAGING_DIR || "/app/data/staging";
 
@@ -154,6 +156,91 @@ export function createArchivesRouter({ ipfsTree, helia, ipnsPublish, ipnsResolve
       });
     } catch (err) {
       console.error("DELETE /archives/* error:", err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // GET /archives/debug — Verify block availability for the archive tree.
+  // Checks if the root and child blocks exist in the local blockstore,
+  // and reports registered libp2p protocols (bitswap, DHT, etc.).
+  // Use this to diagnose why IPFS content isn't accessible externally.
+  router.get("/debug", async (req, res) => {
+    try {
+      const rootCid = ipfsTree.getRootCid();
+      if (!rootCid) {
+        return res.json({ error: "No archive root CID set" });
+      }
+
+      const result = {
+        root_cid: rootCid.toString(),
+        peer_id: helia.libp2p.peerId.toString(),
+        peer_count: helia.libp2p.getPeers().length,
+        protocols: helia.libp2p.getProtocols(),
+        root_block: { exists: false },
+        children: [],
+      };
+
+      // Check root block in local blockstore
+      try {
+        const exists = await helia.blockstore.has(rootCid);
+        result.root_block.exists = exists;
+        if (exists) {
+          const block = await helia.blockstore.get(rootCid);
+          result.root_block.size = block.length;
+        }
+      } catch (err) {
+        result.root_block.error = err.message;
+      }
+
+      // List children and check their blocks
+      const fs = unixfs(helia);
+      try {
+        for await (const entry of fs.ls(rootCid)) {
+          const child = {
+            name: entry.name,
+            cid: entry.cid.toString(),
+            type: entry.type === "directory" ? "directory" : "file",
+            block_exists: false,
+          };
+          try {
+            const exists = await helia.blockstore.has(entry.cid);
+            child.block_exists = exists;
+            if (exists) {
+              const block = await helia.blockstore.get(entry.cid);
+              child.block_size = block.length;
+            }
+          } catch (err) {
+            child.block_error = err.message;
+          }
+          result.children.push(child);
+        }
+      } catch (err) {
+        result.children_error = err.message;
+      }
+
+      res.json(result);
+    } catch (err) {
+      console.error("GET /archives/debug error:", err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // GET /archives/block/:cid — Serve a raw IPFS block via HTTP.
+  // Bypasses bitswap entirely — useful for verifying blocks exist in the
+  // local blockstore without relying on the IPFS peer-to-peer protocol.
+  router.get("/block/:cid", async (req, res) => {
+    try {
+      const cid = CID.parse(req.params.cid);
+      const exists = await helia.blockstore.has(cid);
+      if (!exists) {
+        return res.status(404).json({ error: "Block not found in local blockstore" });
+      }
+      const block = await helia.blockstore.get(cid);
+      res.set("Content-Type", "application/octet-stream");
+      res.set("Content-Length", block.length);
+      res.set("ETag", `"${cid.toString()}"`);
+      res.send(Buffer.from(block));
+    } catch (err) {
       res.status(500).json({ error: err.message });
     }
   });
