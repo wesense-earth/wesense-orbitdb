@@ -101,7 +101,7 @@ const PROVIDE_INTERVAL = 30 * 60_000; // Re-announce to DHT every 30 minutes
  * When a new provider is found, we dial them — once connected,
  * GossipSub kicks in and OrbitDB replicates.
  */
-function startPeerDiscovery(helia, dbs) {
+function startPeerDiscovery(helia, dbs, ipfsTree) {
   // Extract CIDs from OrbitDB database addresses (/orbitdb/zdpuAk...)
   const dbCids = [dbs.nodes, dbs.trust, dbs.attestations].map((db) => {
     const cidStr = db.address.toString().split("/").pop();
@@ -116,7 +116,20 @@ function startPeerDiscovery(helia, dbs) {
         console.warn(`DHT provide failed for ${cid}: ${err.message}`);
       }
     }
-    console.log("DHT: Provided database CIDs to IPFS network");
+    // Also re-provide the archive root CID so public IPFS gateways can find it
+    // (DHT provider records expire after ~24 hours)
+    const archiveRootCid = ipfsTree.getRootCid();
+    if (archiveRootCid) {
+      try {
+        await helia.routing.provide(archiveRootCid, { signal: AbortSignal.timeout(30_000) });
+        console.log(`DHT: Provided database CIDs + archive root ${archiveRootCid} to IPFS network`);
+      } catch (err) {
+        console.warn(`DHT provide for archive root failed: ${err.message}`);
+        console.log("DHT: Provided database CIDs to IPFS network");
+      }
+    } else {
+      console.log("DHT: Provided database CIDs to IPFS network");
+    }
   };
 
   const discover = async () => {
@@ -228,12 +241,12 @@ async function main() {
       faultTolerance: 1, // NO_FATAL
     },
     connectionManager: {
-      // Keep connection count low to avoid event-loop starvation from
-      // constant IPFS peer churn (connect/disconnect/identify cycles).
-      // WeSense only needs a handful of peers for OrbitDB replication +
-      // enough DHT connections for content routing.
-      minConnections: 3,
-      maxConnections: 20,
+      // Need enough connections for both WeSense OrbitDB replication AND
+      // IPFS DHT routing (content providing/discovery). Too low and the
+      // connection manager prunes DHT peers in favour of gossipsub-tagged
+      // WeSense peers, isolating the node from the public IPFS network.
+      minConnections: 5,
+      maxConnections: 50,
     },
     peerDiscovery: [
       // Use a non-standard mDNS port to avoid conflict with avahi-daemon
@@ -421,9 +434,6 @@ async function main() {
     console.log(`Direct peer dialing enabled for: ${WESENSE_PEER_ADDRS.join(", ")}`);
   }
 
-  // Start DHT-based peer discovery for cross-station replication
-  startPeerDiscovery(helia, dbs);
-
   // IPFS archive tree — manages the browsable directory structure on IPFS
   const ipfsTree = createIPFSTree(helia);
 
@@ -438,16 +448,15 @@ async function main() {
     if (saved.root_cid) {
       ipfsTree.setRootCid(saved.root_cid);
       console.log(`Loaded archive tree root CID: ${saved.root_cid}`);
-      // Announce to DHT so the content is discoverable after restart
-      const savedCid = ipfsTree.getRootCid();
-      helia.routing.provide(savedCid, { signal: AbortSignal.timeout(30_000) }).then(
-        () => console.log(`DHT: Re-provided archive root CID ${saved.root_cid}`),
-        (err) => console.warn(`DHT provide for archive root failed: ${err.message}`)
-      );
     }
   } catch {
     // No persisted root — first run or reset
   }
+
+  // Start DHT-based peer discovery for cross-station replication.
+  // Must be after ipfsTree + root CID load so the first provide cycle
+  // includes the archive root CID alongside OrbitDB database CIDs.
+  startPeerDiscovery(helia, dbs, ipfsTree);
 
   // IPNS publish/resolve helpers using Helia's libp2p peer key
   // @helia/ipns v8+ requires a PrivateKey for publish (not PeerId)
