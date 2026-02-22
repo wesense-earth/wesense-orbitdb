@@ -46,18 +46,16 @@ const BOOTSTRAP_PEERS = process.env.ORBITDB_BOOTSTRAP_PEERS || "";
 const NODE_TTL_DAYS = parseInt(process.env.NODE_TTL_DAYS || "7", 10);
 
 // Public IPFS bootstrap nodes — entry points into the IPFS DHT.
-// All 5 are available but we only use 2 per startup to limit connection churn.
-const ALL_IPFS_BOOTSTRAP_NODES = [
+// Use all of them to maximise chances of populating the DHT routing table.
+// Bootstrap peers are entry points only — the DHT discovers closer peers
+// through routing table walks once connected.
+const IPFS_BOOTSTRAP_NODES = [
   "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
   "/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
   "/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
   "/dnsaddr/va1.bootstrap.libp2p.io/p2p/12D3KooWKnDdG3iXw9eTFijk3EWSunZcFi54Zka4wmtqtt6rPxc8",
   "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
 ];
-// Shuffle and pick 2 random bootstrap nodes for this run
-const IPFS_BOOTSTRAP_NODES = ALL_IPFS_BOOTSTRAP_NODES
-  .sort(() => Math.random() - 0.5)
-  .slice(0, 2);
 
 // Parse ORBITDB_BOOTSTRAP_PEERS — supports multiple formats:
 //   Full multiaddr: /ip4/203.0.113.1/tcp/4001/p2p/12D3KooW...
@@ -259,7 +257,14 @@ async function main() {
       identify: identify(),
       ping: ping(),
       pubsub: gossipsub({ allowPublishToZeroTopicPeers: true }),
-      aminoDHT: kadDHT({ protocol: "/ipfs/kad/1.0.0" }),
+      // Force DHT server mode when ANNOUNCE_ADDRESS is set (publicly reachable).
+      // Without this, the DHT defaults to client mode (no AutoNAT configured),
+      // making our node uninteresting to other peers — they disconnect us quickly.
+      // Server mode means we serve DHT records, giving peers a reason to stay connected.
+      aminoDHT: kadDHT({
+        protocol: "/ipfs/kad/1.0.0",
+        clientMode: !ANNOUNCE_ADDRESS,
+      }),
     },
   });
 
