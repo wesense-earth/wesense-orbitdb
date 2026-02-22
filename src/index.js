@@ -218,12 +218,28 @@ async function main() {
     ? [`/${announceProto}/${ANNOUNCE_ADDRESS}/tcp/${LIBP2P_PORT}`]
     : [];
 
-  // Use a dedicated datastore for libp2p so identity keys are persisted
-  // across restarts (stable PeerID is critical for DHT provider records).
+  // Use a dedicated datastore for libp2p peer metadata
   await mkdir(`${DATA_DIR}/libp2p`, { recursive: true });
   const libp2pDatastore = new FsDatastore(`${DATA_DIR}/libp2p`);
 
+  // Peer identity persistence — stable peer ID across restarts.
+  // Critical for DHT provider records and IPNS: if the peer ID changes,
+  // previous provider records become orphaned and IPNS names expire.
+  // We persist the private key to a file rather than relying on libp2p's
+  // datastore auto-persistence, which doesn't work reliably across versions.
+  const keyPath = `${DATA_DIR}/peer_key`;
+  let privateKey;
+  try {
+    const keyBytes = await readFile(keyPath);
+    const { privateKeyFromProtobuf } = await import("@libp2p/crypto/keys");
+    privateKey = privateKeyFromProtobuf(keyBytes);
+    console.log("Loaded persisted peer identity");
+  } catch (err) {
+    console.log(`Generating new peer identity (${err.code === "ENOENT" ? "first run" : err.message})`);
+  }
+
   const libp2p = await createLibp2p({
+    ...(privateKey ? { privateKey } : {}),
     datastore: libp2pDatastore,
     addresses: {
       listen: [`/ip4/0.0.0.0/tcp/${LIBP2P_PORT}`],
@@ -269,6 +285,18 @@ async function main() {
   });
 
   const helia = await createHelia({ libp2p, blockstore, datastore });
+
+  // Persist peer key if this is the first run (wasn't loaded from disk)
+  if (!privateKey) {
+    try {
+      const { privateKeyToProtobuf } = await import("@libp2p/crypto/keys");
+      await writeFile(keyPath, privateKeyToProtobuf(helia.libp2p.privateKey));
+      console.log("Peer identity saved to disk (will be stable across restarts)");
+    } catch (err) {
+      console.warn(`Could not persist peer key: ${err.message}`);
+    }
+  }
+
   console.log(`Helia peer ID: ${helia.libp2p.peerId.toString()}`);
   console.log(`Announced addresses: ${helia.libp2p.getMultiaddrs().map((a) => a.toString()).join(", ")}`);
   if (WESENSE_PEER_ADDRS.length > 0) {
