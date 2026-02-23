@@ -20,7 +20,7 @@ import { mdns } from "@libp2p/mdns";
 import { gossipsub } from "@chainsafe/libp2p-gossipsub";
 import { identify } from "@libp2p/identify";
 import { bootstrap } from "@libp2p/bootstrap";
-import { kadDHT } from "@libp2p/kad-dht";
+import { kadDHT, removePrivateAddressesMapper } from "@libp2p/kad-dht";
 import { ping } from "@libp2p/ping";
 import { FsBlockstore } from "blockstore-fs";
 import { FsDatastore } from "datastore-fs";
@@ -266,9 +266,11 @@ async function main() {
       // Need enough connections for both WeSense OrbitDB replication AND
       // IPFS DHT routing (content providing/discovery). Too low and the
       // connection manager prunes DHT peers in favour of gossipsub-tagged
-      // WeSense peers, isolating the node from the public IPFS network.
-      minConnections: 5,
-      maxConnections: 50,
+      // WeSense peers, leaving a sparse routing table that makes content
+      // undiscoverable by public IPFS gateways. A well-connected DHT node
+      // typically needs 20-50+ peers for reliable provider record placement.
+      minConnections: 20,
+      maxConnections: 100,
     },
     peerDiscovery: [
       // Use a non-standard mDNS port to avoid conflict with avahi-daemon
@@ -281,13 +283,16 @@ async function main() {
       identify: identify(),
       ping: ping(),
       pubsub: gossipsub({ allowPublishToZeroTopicPeers: true }),
-      // Force DHT server mode when ANNOUNCE_ADDRESS is set (publicly reachable).
-      // Without this, the DHT defaults to client mode (no AutoNAT configured),
-      // making our node uninteresting to other peers — they disconnect us quickly.
-      // Server mode means we serve DHT records, giving peers a reason to stay connected.
+      // Amino DHT — the public IPFS Kademlia network for content discovery.
+      // Server mode when ANNOUNCE_ADDRESS is set (publicly reachable), otherwise
+      // client mode. Server mode serves DHT records, giving peers a reason to
+      // stay connected and making our provider records more discoverable.
+      // removePrivateAddressesMapper filters LAN IPs from DHT records so the
+      // routing table only contains publicly reachable peers (per Amino spec).
       aminoDHT: kadDHT({
         protocol: "/ipfs/kad/1.0.0",
         clientMode: !ANNOUNCE_ADDRESS,
+        peerInfoMapper: removePrivateAddressesMapper,
       }),
     },
   });
@@ -486,6 +491,23 @@ async function main() {
   // Must be after ipfsTree + root CID load so the first provide cycle
   // includes the archive root CID alongside OrbitDB database CIDs.
   startPeerDiscovery(helia, dbs, ipfsTree);
+
+  // Aggressively refresh the DHT routing table at startup and periodically.
+  // The default self-query interval populates the routing table over time,
+  // but with minConnections raised to 20 we want to fill the table faster
+  // so our provider records land on well-connected DHT peers. This makes
+  // archive CIDs discoverable by public IPFS gateways.
+  const dht = helia.libp2p.services.aminoDHT;
+  if (dht?.refreshRoutingTable) {
+    setTimeout(async () => {
+      try {
+        await dht.refreshRoutingTable();
+        console.log(`DHT: Routing table refreshed (${helia.libp2p.getPeers().length} peers)`);
+      } catch (err) {
+        console.warn(`DHT: Routing table refresh failed: ${err.message}`);
+      }
+    }, 15_000); // 15s after startup — let bootstrap connections establish first
+  }
 
   // IPNS publish/resolve helpers using Helia's libp2p peer key
   // @helia/ipns v8+ requires a PrivateKey for publish (not PeerId)
