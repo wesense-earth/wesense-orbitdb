@@ -35,11 +35,8 @@ import { createNodesRouter } from "./routes/nodes.js";
 import { createTrustRouter } from "./routes/trust.js";
 import { createAttestationsRouter } from "./routes/attestations.js";
 import { createHealthRouter } from "./routes/health.js";
-import { createArchivesRouter } from "./routes/archives.js";
-import { createIPFSTree } from "./ipfs-tree.js";
-
 const PORT = parseInt(process.env.PORT || "5200", 10);
-const LIBP2P_PORT = parseInt(process.env.LIBP2P_PORT || "4001", 10);
+const LIBP2P_PORT = parseInt(process.env.LIBP2P_PORT || "4002", 10);
 const DATA_DIR = process.env.DATA_DIR || "./data";
 const ANNOUNCE_ADDRESS = process.env.ANNOUNCE_ADDRESS || "";
 const BOOTSTRAP_PEERS = process.env.ORBITDB_BOOTSTRAP_PEERS || "";
@@ -99,7 +96,7 @@ const PROVIDE_INTERVAL = 30 * 60_000; // Re-announce to DHT every 30 minutes
  * When a new provider is found, we dial them — once connected,
  * GossipSub kicks in and OrbitDB replicates.
  */
-function startPeerDiscovery(helia, dbs, ipfsTree) {
+function startPeerDiscovery(helia, dbs) {
   // Extract CIDs from OrbitDB database addresses (/orbitdb/zdpuAk...)
   const dbCids = [dbs.nodes, dbs.trust, dbs.attestations].map((db) => {
     const cidStr = db.address.toString().split("/").pop();
@@ -114,20 +111,7 @@ function startPeerDiscovery(helia, dbs, ipfsTree) {
         console.warn(`DHT provide failed for ${cid}: ${err.message}`);
       }
     }
-    // Also re-provide the archive root CID so public IPFS gateways can find it
-    // (DHT provider records expire after ~24 hours)
-    const archiveRootCid = ipfsTree.getRootCid();
-    if (archiveRootCid) {
-      try {
-        await helia.routing.provide(archiveRootCid, { signal: AbortSignal.timeout(30_000) });
-        console.log(`DHT: Provided database CIDs + archive root ${archiveRootCid} to IPFS network`);
-      } catch (err) {
-        console.warn(`DHT provide for archive root failed: ${err.message}`);
-        console.log("DHT: Provided database CIDs to IPFS network");
-      }
-    } else {
-      console.log("DHT: Provided database CIDs to IPFS network");
-    }
+    console.log("DHT: Provided database CIDs to IPFS network");
   };
 
   const discover = async () => {
@@ -468,29 +452,8 @@ async function main() {
     console.log(`Direct peer dialing enabled for: ${WESENSE_PEER_ADDRS.join(", ")}`);
   }
 
-  // IPFS archive tree — manages the browsable directory structure on IPFS
-  const ipfsTree = createIPFSTree(helia);
-
-  // Ensure staging directory exists (shared volume with archiver)
-  const archiveStagingDir = process.env.ARCHIVE_STAGING_DIR || `${DATA_DIR}/staging`;
-  await mkdir(archiveStagingDir, { recursive: true });
-
-  // Load persisted root CID if it exists
-  const rootCidPath = `${DATA_DIR}/archive_root_cid.json`;
-  try {
-    const saved = JSON.parse(await readFile(rootCidPath, "utf-8"));
-    if (saved.root_cid) {
-      ipfsTree.setRootCid(saved.root_cid);
-      console.log(`Loaded archive tree root CID: ${saved.root_cid}`);
-    }
-  } catch {
-    // No persisted root — first run or reset
-  }
-
   // Start DHT-based peer discovery for cross-station replication.
-  // Must be after ipfsTree + root CID load so the first provide cycle
-  // includes the archive root CID alongside OrbitDB database CIDs.
-  startPeerDiscovery(helia, dbs, ipfsTree);
+  startPeerDiscovery(helia, dbs);
 
   // Aggressively refresh the DHT routing table at startup and periodically.
   // The default self-query interval populates the routing table over time,
@@ -509,40 +472,6 @@ async function main() {
     }, 15_000); // 15s after startup — let bootstrap connections establish first
   }
 
-  // IPNS publish/resolve helpers using Helia's libp2p peer key
-  // @helia/ipns v8+ requires a PrivateKey for publish (not PeerId)
-  let ipnsPublish = null;
-  let ipnsResolve = null;
-  try {
-    const { ipns: createIPNS } = await import("@helia/ipns");
-    const ipnsInstance = createIPNS(helia);
-    const peerId = helia.libp2p.peerId;
-
-    if (!privateKey) {
-      throw new Error("Private key not available (peer key generation failed at startup)");
-    }
-
-    ipnsPublish = async (cid) => {
-      await ipnsInstance.publish(privateKey, cid);
-      const name = peerId.toString();
-      console.log(`IPNS published: ${name} -> ${cid.toString()}`);
-      return name;
-    };
-
-    ipnsResolve = async () => {
-      const result = await ipnsInstance.resolve(peerId, {
-        signal: AbortSignal.timeout(10_000),
-      });
-      return {
-        name: peerId.toString(),
-        cid: result.cid.toString(),
-      };
-    };
-    console.log("IPNS publish/resolve initialized");
-  } catch (err) {
-    console.warn(`IPNS initialization skipped: ${err.message}`);
-  }
-
   // Express HTTP API
   const app = express();
   app.use(express.json());
@@ -551,12 +480,6 @@ async function main() {
   app.use("/trust", createTrustRouter(dbs.trust));
   app.use("/attestations", createAttestationsRouter(dbs.attestations));
   app.use("/health", createHealthRouter({ helia, dbs }));
-  // Persist root CID to disk after every successful archive operation (independent of IPNS)
-  const persistRootCid = async (cid) => {
-    await writeFile(rootCidPath, JSON.stringify({ root_cid: cid.toString() }));
-  };
-
-  app.use("/archives", createArchivesRouter({ ipfsTree, helia, ipnsPublish, ipnsResolve, persistRootCid }));
 
   // Retry listen — with network_mode: host the previous container may not
   // have fully released the port yet during a restart.
