@@ -321,6 +321,15 @@ async function main() {
   const dbs = await openDatabases(orbitdb);
   console.log(`Databases opened — nodes: ${dbs.nodes.address}, trust: ${dbs.trust.address}`);
 
+  // Diagnostic: verify gossipsub topic subscriptions after database open
+  const pubsubDiag = helia.libp2p.services.pubsub;
+  const subscribedTopics = pubsubDiag.getTopics ? pubsubDiag.getTopics() : [];
+  console.log(`GossipSub topics after DB open: [${subscribedTopics.join(", ")}]`);
+  console.log(`GossipSub started: ${pubsubDiag.status?.code ?? pubsubDiag.isStarted?.() ?? "unknown"}`);
+  for (const [name, db] of Object.entries(dbs)) {
+    console.log(`  ${name}: sync=${!!db.sync}, sync.peers=${db.sync?.peers?.size ?? "N/A"}`);
+  }
+
   // Database replication event logging (join only — update events are too noisy)
   for (const [name, db] of Object.entries(dbs)) {
     db.events.on("join", (peerId, heads) => {
