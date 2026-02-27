@@ -111,6 +111,59 @@ export function createHealthRouter({ helia, dbs }) {
     }
   });
 
+  // GET /health/peer/:peerId — Check what protocols a specific peer supports
+  router.get("/peer/:peerId", async (req, res) => {
+    try {
+      const { peerId: peerIdStr } = req.params;
+      const pubsub = helia.libp2p.services.pubsub;
+
+      // Find the PeerId object from connected peers
+      const connectedPeers = helia.libp2p.getPeers();
+      const matchingPeer = connectedPeers.find(p => p.toString() === peerIdStr);
+
+      // Check peer's protocols from peer store
+      let protocols = [];
+      let peerAddrs = [];
+      let storeError = null;
+      if (matchingPeer) {
+        try {
+          const peerData = await helia.libp2p.peerStore.get(matchingPeer);
+          protocols = peerData.protocols ?? [];
+          peerAddrs = peerData.addresses?.map(a => a.multiaddr.toString()) ?? [];
+        } catch (e) {
+          storeError = e.message;
+        }
+      }
+
+      // Check if peer is in gossipsub internal peers map
+      const gsPeerIds = pubsub.peers ? [...pubsub.peers.keys()].map(String) : [];
+      const isGossipsubPeer = gsPeerIds.includes(peerIdStr);
+
+      // Check connections to this peer
+      const connections = matchingPeer
+        ? helia.libp2p.getConnections(matchingPeer).map(c => ({
+            remoteAddr: c.remoteAddr.toString(),
+            status: c.status,
+            direction: c.direction,
+            streams: c.streams.map(s => ({ protocol: s.protocol, direction: s.direction })),
+          }))
+        : [];
+
+      res.json({
+        peer_id: peerIdStr,
+        is_connected: !!matchingPeer,
+        is_gossipsub_peer: isGossipsubPeer,
+        protocols,
+        addresses: peerAddrs,
+        store_error: storeError,
+        connections,
+        gossipsub_multicodecs: pubsub.multicodecs ?? [],
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // GET /health/pubsub-test — Diagnostic: test if gossipsub subscribe/getTopics works
   router.get("/pubsub-test", (req, res) => {
     try {
