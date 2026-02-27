@@ -171,5 +171,89 @@ export function createHealthRouter({ helia, dbs }) {
     }
   });
 
+  // Diagnostic: directly attempt to create gossipsub outbound streams and
+  // return step-by-step results. This bypasses gossipsub's internal queue.
+  router.get("/fix-gossipsub", async (req, res) => {
+    try {
+      const pubsub = helia.libp2p.services.pubsub;
+      const connectedPeers = helia.libp2p.getPeers();
+      const results = [];
+
+      for (const peerId of connectedPeers) {
+        const id = peerId.toString();
+        const result = { peer: id };
+
+        // Check guards
+        result.isStarted = pubsub.isStarted?.() ?? "unknown";
+        result.inPeersMap = pubsub.peers?.has(id) ?? false;
+        result.hasOutbound = pubsub.streamsOutbound?.has(id) ?? false;
+        result.hasInbound = pubsub.streamsInbound?.has(id) ?? false;
+
+        if (result.hasOutbound) {
+          result.action = "already_has_stream";
+          results.push(result);
+          continue;
+        }
+
+        // Ensure peer is in gossipsub's peers map
+        if (!result.inPeersMap && pubsub.addPeer) {
+          const conns = helia.libp2p.getConnections(peerId);
+          if (conns.length > 0) {
+            pubsub.addPeer(peerId, conns[0].direction, conns[0].remoteAddr);
+            result.addedToPeers = true;
+            result.inPeersMap = pubsub.peers?.has(id) ?? false;
+          }
+        }
+
+        // Try calling createOutboundStream directly
+        const conns = helia.libp2p.getConnections(peerId);
+        if (conns.length === 0) {
+          result.action = "no_connections";
+          results.push(result);
+          continue;
+        }
+
+        result.connectionStatus = conns[0].status;
+        result.connectionDirection = conns[0].direction;
+
+        try {
+          await pubsub.createOutboundStream(peerId, conns[0]);
+          result.afterCreate_hasOutbound =
+            pubsub.streamsOutbound?.has(id) ?? false;
+          result.action = result.afterCreate_hasOutbound
+            ? "stream_created"
+            : "create_returned_but_no_stream";
+        } catch (err) {
+          result.action = "create_threw";
+          result.error = err.message;
+          result.errorName = err.name;
+          result.errorCode = err.code;
+        }
+
+        results.push(result);
+      }
+
+      res.json({
+        gossipsub_started: pubsub.isStarted?.() ?? "unknown",
+        gossipsub_multicodecs: pubsub.multicodecs || [],
+        outbound_before: pubsub.streamsOutbound
+          ? [...pubsub.streamsOutbound.keys()]
+          : [],
+        inbound_before: pubsub.streamsInbound
+          ? [...pubsub.streamsInbound.keys()]
+          : [],
+        peer_results: results,
+        outbound_after: pubsub.streamsOutbound
+          ? [...pubsub.streamsOutbound.keys()]
+          : [],
+        inbound_after: pubsub.streamsInbound
+          ? [...pubsub.streamsInbound.keys()]
+          : [],
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message, stack: err.stack });
+    }
+  });
+
   return router;
 }
