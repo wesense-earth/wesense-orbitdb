@@ -197,6 +197,37 @@ async function main() {
   const dbs = await openDatabases(orbitdb);
   console.log(`Databases opened — nodes: ${dbs.nodes.address}, trust: ${dbs.trust.address}`);
 
+  // Workaround: libp2p@3 starts all services in parallel (identify, gossipsub,
+  // transports, mDNS). If identify completes for a peer before gossipsub has
+  // registered its topology, the peer:identify event fires but the registrar
+  // finds no gossipsub topology to notify. The peer stays connected at TCP
+  // level but gossipsub never opens a protocol stream to it.
+  //
+  // This nudge uses gossipsub's internal connect() to re-trigger topology
+  // callbacks for any peers it missed during the startup race.
+  const nudgeGossipsub = async () => {
+    const pubsub = helia.libp2p.services.pubsub;
+    const connectedPeers = helia.libp2p.getPeers();
+    const gossipPeers = pubsub.peers ? pubsub.peers.size : 0;
+    if (connectedPeers.length > 0 && gossipPeers < connectedPeers.length) {
+      console.log(`Gossipsub nudge: ${gossipPeers}/${connectedPeers.length} peers have gossipsub streams`);
+      for (const peerId of connectedPeers) {
+        if (pubsub.peers?.has(peerId.toString())) continue;
+        try {
+          // gossipsub.connect() opens a connection (reuses existing) and
+          // manually fires topology.onConnect for each gossipsub multicodec.
+          await pubsub.connect(peerId.toString());
+          console.log(`Gossipsub nudge: connected to ${peerId}`);
+        } catch (err) {
+          console.warn(`Gossipsub nudge failed for ${peerId}: ${err.message}`);
+        }
+      }
+    }
+  };
+  setTimeout(nudgeGossipsub, 5_000);
+  setTimeout(nudgeGossipsub, 15_000);
+  setTimeout(nudgeGossipsub, 30_000);
+
   // Database replication event logging
   for (const [name, db] of Object.entries(dbs)) {
     db.events.on("join", (peerId, heads) => {
