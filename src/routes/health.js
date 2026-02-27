@@ -45,17 +45,26 @@ export function createHealthRouter({ helia, dbs }) {
       // Peers subscribed to OrbitDB database topics are other WeSense stations
       // (not IPFS bootstrap relays or transient DHT peers).
       const pubsub = helia.libp2p.services.pubsub;
-      const topics = pubsub.getTopics ? pubsub.getTopics() : [];
+      const allTopics = pubsub.getTopics ? pubsub.getTopics() : [];
       const topicPeers = {};
       const wesensePeerSet = new Set();
-      for (const topic of topics) {
+      for (const topic of allTopics) {
         const subs = pubsub.getSubscribers ? pubsub.getSubscribers(topic) : [];
-        if (subs.length > 0) {
-          topicPeers[topic] = subs.map((p) => p.toString());
-          for (const p of subs) wesensePeerSet.add(p.toString());
-        }
+        topicPeers[topic] = subs.map((p) => p.toString());
+        for (const p of subs) wesensePeerSet.add(p.toString());
       }
       const wesensePeers = [...wesensePeerSet];
+
+      // Database sync diagnostics — check if OrbitDB's Sync protocol started
+      const syncState = {};
+      for (const [name, db] of Object.entries(dbs)) {
+        syncState[name] = {
+          has_sync: !!db.sync,
+          sync_peers: db.sync?.peers ? [...db.sync.peers] : [],
+          sync_has_start: typeof db.sync?.start === "function",
+          sync_has_stop: typeof db.sync?.stop === "function",
+        };
+      }
 
       res.json({
         status: "ok",
@@ -76,10 +85,55 @@ export function createHealthRouter({ helia, dbs }) {
           attestations: dbs.attestations.address.toString(),
         },
         gossipsub_topics: topicPeers,
+        gossipsub_subscribed_topics: allTopics,
+        gossipsub_status: pubsub.status?.code ?? pubsub.isStarted?.() ?? "unknown",
+        sync_state: syncState,
       });
     } catch (err) {
       console.error("GET /health error:", err);
       res.status(500).json({ status: "error", error: err.message });
+    }
+  });
+
+  // GET /health/pubsub-test — Diagnostic: test if gossipsub subscribe/getTopics works
+  router.get("/pubsub-test", (req, res) => {
+    try {
+      const pubsub = helia.libp2p.services.pubsub;
+      const testTopic = "__wesense_diag_test__";
+      const beforeTopics = pubsub.getTopics ? pubsub.getTopics() : [];
+      let subscribeError = null;
+      try {
+        pubsub.subscribe(testTopic);
+      } catch (e) {
+        subscribeError = e.message;
+      }
+      const afterTopics = pubsub.getTopics ? pubsub.getTopics() : [];
+      // Clean up
+      try { pubsub.unsubscribe(testTopic); } catch {}
+      const afterCleanup = pubsub.getTopics ? pubsub.getTopics() : [];
+
+      // Also check db addresses (what OrbitDB should subscribe to)
+      const expectedTopics = Object.entries(dbs).map(([name, db]) => ({
+        name,
+        address: db.address.toString(),
+      }));
+
+      res.json({
+        pubsub_type: pubsub.constructor?.name ?? typeof pubsub,
+        pubsub_status: pubsub.status ?? "no status property",
+        subscribe_error: subscribeError,
+        topics_before_test: beforeTopics,
+        topics_after_subscribe: afterTopics,
+        topics_after_cleanup: afterCleanup,
+        test_topic_appeared: afterTopics.includes(testTopic),
+        expected_db_topics: expectedTopics,
+        has_getTopics: typeof pubsub.getTopics === "function",
+        has_subscribe: typeof pubsub.subscribe === "function",
+        has_getSubscribers: typeof pubsub.getSubscribers === "function",
+      });
+    } catch (err) {
+      console.error("GET /health/pubsub-test error:", err);
+      res.status(500).json({ status: "error", error: err.message, stack: err.stack });
     }
   });
 
