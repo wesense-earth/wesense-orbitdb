@@ -107,7 +107,11 @@ async function main() {
     }
   }
 
+  // Create libp2p without auto-start so we can configure gossipsub before
+  // services begin. This avoids the parallel startup race where mDNS discovers
+  // peers before gossipsub registers its topology callbacks.
   const libp2p = await createLibp2p({
+    start: false,
     ...(privateKey ? { privateKey } : {}),
     datastore: libp2pDatastore,
     addresses: {
@@ -141,6 +145,22 @@ async function main() {
       pubsub: gossipsub({ allowPublishToZeroTopicPeers: true }),
     },
   });
+
+  // Workaround: gossipsub@14 registers 3 multicodecs (/meshsub/1.2.0, 1.1.0,
+  // 1.0.0). When connection.newStream() is called with multiple protocols,
+  // libp2p@3 uses multistream-select (MSS) negotiation instead of early
+  // protocol negotiation. MSS negotiation appears to fail silently in this
+  // version combination, preventing gossipsub from creating outbound streams.
+  //
+  // By restricting to a single protocol, newStream() uses early negotiation
+  // (protocol pre-selected at yamux stream creation), bypassing MSS entirely.
+  // All WeSense nodes run the same stack, so backward compat isn't needed.
+  const pubsubService = libp2p.services.pubsub;
+  if (pubsubService.multicodecs) {
+    console.log(`Gossipsub multicodecs before: ${pubsubService.multicodecs.join(", ")}`);
+    pubsubService.multicodecs = ["/meshsub/1.2.0"];
+    console.log(`Gossipsub multicodecs after: ${pubsubService.multicodecs.join(", ")}`);
+  }
 
   // Helia defaults add trustlessGateway(), httpGatewayRouting(), and
   // libp2pRouting() which connect to the public IPFS network. Disable all
@@ -197,36 +217,47 @@ async function main() {
   const dbs = await openDatabases(orbitdb);
   console.log(`Databases opened — nodes: ${dbs.nodes.address}, trust: ${dbs.trust.address}`);
 
-  // Workaround: libp2p@3 starts all services in parallel (identify, gossipsub,
-  // transports, mDNS). If identify completes for a peer before gossipsub has
-  // registered its topology, the peer:identify event fires but the registrar
-  // finds no gossipsub topology to notify. The peer stays connected at TCP
-  // level but gossipsub never opens a protocol stream to it.
-  //
-  // This nudge uses gossipsub's internal connect() to re-trigger topology
-  // callbacks for any peers it missed during the startup race.
-  const nudgeGossipsub = async () => {
-    const pubsub = helia.libp2p.services.pubsub;
+  // Gossipsub error logging — gossipsub@14 swallows stream creation errors
+  // into debug-only logging (libp2p:gossipsub namespace). Monkey-patch the
+  // log.error method to also write to console so we can see failures.
+  const pubsub = helia.libp2p.services.pubsub;
+  if (pubsub.log?.error) {
+    const origLogError = pubsub.log.error;
+    pubsub.log.error = (...args) => {
+      console.error("[gossipsub]", ...args);
+      return origLogError.apply(pubsub.log, args);
+    };
+  }
+
+  // Workaround for libp2p@3 parallel startup race: if peers connected before
+  // gossipsub registered its topology, re-identify them so the peer:identify
+  // event fires again. This triggers the registrar to notify gossipsub's
+  // topology callback, which then creates outbound gossipsub streams.
+  const ensureGossipsubStreams = async () => {
     const connectedPeers = helia.libp2p.getPeers();
-    const gossipPeers = pubsub.peers ? pubsub.peers.size : 0;
-    if (connectedPeers.length > 0 && gossipPeers < connectedPeers.length) {
-      console.log(`Gossipsub nudge: ${gossipPeers}/${connectedPeers.length} peers have gossipsub streams`);
-      for (const peerId of connectedPeers) {
-        if (pubsub.peers?.has(peerId.toString())) continue;
+    const outboundStreams = pubsub.streamsOutbound?.size ?? 0;
+    if (connectedPeers.length === 0 || outboundStreams >= connectedPeers.length) {
+      return; // all peers already have gossipsub streams
+    }
+    console.log(`Gossipsub streams: ${outboundStreams}/${connectedPeers.length} — re-identifying peers`);
+    const identifySvc = helia.libp2p.services.identify;
+    for (const peerId of connectedPeers) {
+      if (pubsub.streamsOutbound?.has(peerId.toString())) continue;
+      const conns = helia.libp2p.getConnections(peerId);
+      for (const conn of conns) {
+        if (conn.status !== "open") continue;
         try {
-          // gossipsub.connect() opens a connection (reuses existing) and
-          // manually fires topology.onConnect for each gossipsub multicodec.
-          await pubsub.connect(peerId.toString());
-          console.log(`Gossipsub nudge: connected to ${peerId}`);
+          await identifySvc.identify(conn);
+          console.log(`Re-identified ${peerId} — gossipsub outbound: ${pubsub.streamsOutbound?.has(peerId.toString())}`);
         } catch (err) {
-          console.warn(`Gossipsub nudge failed for ${peerId}: ${err.message}`);
+          console.warn(`Re-identify failed for ${peerId}: ${err.message}`);
         }
       }
     }
   };
-  setTimeout(nudgeGossipsub, 5_000);
-  setTimeout(nudgeGossipsub, 15_000);
-  setTimeout(nudgeGossipsub, 30_000);
+  setTimeout(ensureGossipsubStreams, 5_000);
+  setTimeout(ensureGossipsubStreams, 15_000);
+  setTimeout(ensureGossipsubStreams, 30_000);
 
   // Database replication event logging
   for (const [name, db] of Object.entries(dbs)) {
