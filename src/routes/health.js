@@ -66,6 +66,19 @@ export function createHealthRouter({ helia, dbs }) {
         };
       }
 
+      // GossipSub internal peer count — peers that negotiated the gossipsub
+      // protocol (not just raw libp2p connections). If this is 0, gossipsub
+      // protocol streams aren't being established.
+      const gossipsubPeerCount = pubsub.peers?.size ?? pubsub.peers?.length ?? "N/A";
+      // Check mesh status per topic
+      const meshState = {};
+      for (const topic of allTopics) {
+        const meshPeers = pubsub.getMeshPeers ? pubsub.getMeshPeers(topic) : [];
+        meshState[topic] = { mesh_peers: meshPeers.length, subscribers: (topicPeers[topic] || []).length };
+      }
+      // Get the gossipsub multicodec/protocol IDs
+      const gsProtocols = pubsub.multicodecs ?? pubsub.protocol ?? "unknown";
+
       res.json({
         status: "ok",
         peer_count: peers.length,
@@ -87,6 +100,9 @@ export function createHealthRouter({ helia, dbs }) {
         gossipsub_topics: topicPeers,
         gossipsub_subscribed_topics: allTopics,
         gossipsub_status: pubsub.status?.code ?? pubsub.isStarted?.() ?? "unknown",
+        gossipsub_peer_count: gossipsubPeerCount,
+        gossipsub_protocols: gsProtocols,
+        gossipsub_mesh: meshState,
         sync_state: syncState,
       });
     } catch (err) {
@@ -120,7 +136,7 @@ export function createHealthRouter({ helia, dbs }) {
 
       res.json({
         pubsub_type: pubsub.constructor?.name ?? typeof pubsub,
-        pubsub_status: pubsub.status ?? "no status property",
+        pubsub_status: pubsub.status?.code ?? "no status code",
         subscribe_error: subscribeError,
         topics_before_test: beforeTopics,
         topics_after_subscribe: afterTopics,
