@@ -76,5 +76,49 @@ export function createHealthRouter({ helia, dbs }) {
     }
   });
 
+  // Temporary diagnostic endpoint to debug gossipsub stream establishment.
+  router.get("/debug", async (req, res) => {
+    try {
+      const pubsub = helia.libp2p.services.pubsub;
+      const connectedPeers = helia.libp2p.getPeers();
+
+      // Gossipsub internal state
+      const gossipPeers = pubsub.peers ? [...pubsub.peers.keys()] : [];
+      const outboundStreams = pubsub.streamsOutbound
+        ? [...pubsub.streamsOutbound.keys()]
+        : [];
+      const inboundStreams = pubsub.streamsInbound
+        ? [...pubsub.streamsInbound.keys()]
+        : [];
+
+      // What protocols each connected peer supports (from identify/peerstore)
+      const peerProtocols = {};
+      for (const peerId of connectedPeers) {
+        try {
+          const peer = await helia.libp2p.peerStore.get(peerId);
+          peerProtocols[peerId.toString()] = peer.protocols || [];
+        } catch {
+          peerProtocols[peerId.toString()] = ["(not in peerstore)"];
+        }
+      }
+
+      // Registered protocols on this node
+      const registeredProtocols = helia.libp2p.getProtocols();
+
+      res.json({
+        connected_peers: connectedPeers.map((p) => p.toString()),
+        gossipsub_peers: gossipPeers,
+        gossipsub_outbound_streams: outboundStreams,
+        gossipsub_inbound_streams: inboundStreams,
+        peer_protocols: peerProtocols,
+        registered_protocols: registeredProtocols,
+        subscriptions: pubsub.getTopics ? pubsub.getTopics() : [],
+      });
+    } catch (err) {
+      console.error("GET /health/debug error:", err);
+      res.status(500).json({ error: err.message, stack: err.stack });
+    }
+  });
+
   return router;
 }
