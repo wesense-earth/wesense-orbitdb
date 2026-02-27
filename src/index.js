@@ -14,7 +14,7 @@
  */
 
 // Must be imported before any helia/libp2p code to patch stream prototypes.
-import "./libp2p-stream-compat.js";
+import { patchRegistrarForLegacyHandlers } from "./libp2p-stream-compat.js";
 
 import { createHelia } from "helia";
 import { createLibp2p } from "libp2p";
@@ -148,6 +148,10 @@ async function main() {
       pubsub: gossipsub({ allowPublishToZeroTopicPeers: true }),
     },
   });
+
+  // Patch registrar before helia starts libp2p — wraps handler signatures
+  // for gossipsub and OrbitDB protocols (see libp2p-stream-compat.js).
+  patchRegistrarForLegacyHandlers(libp2p);
 
   // Helia defaults add trustlessGateway(), httpGatewayRouting(), and
   // libp2pRouting() which connect to the public IPFS network. Disable all
