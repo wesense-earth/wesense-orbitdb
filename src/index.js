@@ -231,15 +231,17 @@ async function main() {
 
   // Workaround for libp2p@3 parallel startup race: if peers connected before
   // gossipsub registered its topology, re-identify them so the peer:identify
-  // event fires again. This triggers the registrar to notify gossipsub's
-  // topology callback, which then creates outbound gossipsub streams.
+  // event fires again. If that still doesn't create streams, bypass the
+  // internal queue and call createOutboundStream directly.
   const ensureGossipsubStreams = async () => {
     const connectedPeers = helia.libp2p.getPeers();
     const outboundStreams = pubsub.streamsOutbound?.size ?? 0;
     if (connectedPeers.length === 0 || outboundStreams >= connectedPeers.length) {
       return; // all peers already have gossipsub streams
     }
-    console.log(`Gossipsub streams: ${outboundStreams}/${connectedPeers.length} — re-identifying peers`);
+    console.log(`Gossipsub streams: ${outboundStreams}/${connectedPeers.length} — attempting to fix`);
+
+    // Step 1: Re-identify peers to trigger topology callbacks
     const identifySvc = helia.libp2p.services.identify;
     for (const peerId of connectedPeers) {
       if (pubsub.streamsOutbound?.has(peerId.toString())) continue;
@@ -248,12 +250,44 @@ async function main() {
         if (conn.status !== "open") continue;
         try {
           await identifySvc.identify(conn);
-          console.log(`Re-identified ${peerId} — gossipsub outbound: ${pubsub.streamsOutbound?.has(peerId.toString())}`);
         } catch (err) {
           console.warn(`Re-identify failed for ${peerId}: ${err.message}`);
         }
       }
     }
+
+    // Wait a moment for the outbound inflight queue to process
+    await new Promise((r) => setTimeout(r, 2000));
+
+    // Step 2: If streams still missing, directly call createOutboundStream
+    // bypassing the internal queue (which may be stuck or not processing).
+    for (const peerId of connectedPeers) {
+      const id = peerId.toString();
+      if (pubsub.streamsOutbound?.has(id)) {
+        console.log(`Gossipsub: stream already exists for ${id}`);
+        continue;
+      }
+      // Ensure peer is in gossipsub's peers map
+      if (!pubsub.peers?.has(id)) {
+        const conns = helia.libp2p.getConnections(peerId);
+        if (conns.length > 0) {
+          pubsub.addPeer?.(peerId, conns[0].direction, conns[0].remoteAddr);
+          console.log(`Gossipsub: manually added peer ${id}`);
+        }
+      }
+      const conns = helia.libp2p.getConnections(peerId);
+      if (conns.length === 0) continue;
+      console.log(`Gossipsub: directly calling createOutboundStream for ${id}`);
+      try {
+        await pubsub.createOutboundStream(peerId, conns[0]);
+        console.log(`Gossipsub: after createOutboundStream for ${id} — has stream: ${pubsub.streamsOutbound?.has(id)}`);
+      } catch (err) {
+        console.error(`Gossipsub: createOutboundStream threw for ${id}: ${err.message}`);
+      }
+    }
+
+    const finalStreams = pubsub.streamsOutbound?.size ?? 0;
+    console.log(`Gossipsub streams after fix: ${finalStreams}/${connectedPeers.length}`);
   };
   setTimeout(ensureGossipsubStreams, 5_000);
   setTimeout(ensureGossipsubStreams, 15_000);
