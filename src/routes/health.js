@@ -105,14 +105,65 @@ export function createHealthRouter({ helia, dbs }) {
       // Registered protocols on this node
       const registeredProtocols = helia.libp2p.getProtocols();
 
+      // Try to manually open a gossipsub stream to the first peer.
+      // Tests both single-protocol (early negotiation) and multi-protocol (MSS).
+      let streamTest = null;
+      const meshsub = "/meshsub/1.2.0";
+      const allMeshsub = ["/meshsub/1.2.0", "/meshsub/1.1.0", "/meshsub/1.0.0"];
+      for (const peerId of connectedPeers) {
+        const peerIdStr = peerId.toString();
+        const protocols = peerProtocols[peerIdStr] || [];
+        if (!protocols.includes(meshsub)) continue;
+        const connections = helia.libp2p.getConnections(peerId);
+        if (connections.length === 0) continue;
+        const conn = connections[0];
+        streamTest = {
+          peer: peerIdStr,
+          connection_status: conn.status,
+          connection_direction: conn.direction,
+          connection_multiplexer: conn.multiplexer,
+          connection_encryption: conn.encryption,
+        };
+        // Test 1: Single protocol (early negotiation, no MSS)
+        try {
+          const stream = await conn.newStream(meshsub, {
+            signal: AbortSignal.timeout(5000),
+          });
+          streamTest.single_protocol_ok = true;
+          streamTest.single_protocol = stream.protocol;
+          await stream.close();
+        } catch (err) {
+          streamTest.single_protocol_ok = false;
+          streamTest.single_protocol_error = err.message;
+          streamTest.single_protocol_error_name = err.name;
+        }
+        // Test 2: Multi protocol (MSS negotiation)
+        try {
+          const stream = await conn.newStream(allMeshsub, {
+            signal: AbortSignal.timeout(5000),
+          });
+          streamTest.multi_protocol_ok = true;
+          streamTest.multi_protocol = stream.protocol;
+          await stream.close();
+        } catch (err) {
+          streamTest.multi_protocol_ok = false;
+          streamTest.multi_protocol_error = err.message;
+          streamTest.multi_protocol_error_name = err.name;
+        }
+        break;
+      }
+
       res.json({
         connected_peers: connectedPeers.map((p) => p.toString()),
+        gossipsub_started: pubsub.isStarted ? pubsub.isStarted() : "unknown",
+        gossipsub_multicodecs: pubsub.multicodecs || [],
         gossipsub_peers: gossipPeers,
         gossipsub_outbound_streams: outboundStreams,
         gossipsub_inbound_streams: inboundStreams,
         peer_protocols: peerProtocols,
         registered_protocols: registeredProtocols,
         subscriptions: pubsub.getTopics ? pubsub.getTopics() : [],
+        stream_test: streamTest,
       });
     } catch (err) {
       console.error("GET /health/debug error:", err);
