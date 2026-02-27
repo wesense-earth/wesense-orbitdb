@@ -1,14 +1,16 @@
 /**
  * WeSense OrbitDB Service
  *
- * Helia (IPFS) + OrbitDB + Express HTTP API for distributed
+ * Helia (libp2p) + OrbitDB + Express HTTP API for distributed
  * node registration, trust list sync, and archive attestations.
  *
- * Peer discovery is automatic:
+ * This is a WeSense-only P2P network on port 4002 for sharing live
+ * state between stations. It is NOT connected to the public IPFS
+ * network — that role belongs to Kubo on port 4001.
+ *
+ * Peer discovery:
  *   - LAN: mDNS (zero config, requires network_mode: host in Docker)
- *   - WAN: IPFS DHT provider records — each station "provides" its
- *     OrbitDB database CIDs to the global DHT and periodically searches
- *     for other providers, dialing them when found
+ *   - WAN: Direct dial via ORBITDB_BOOTSTRAP_PEERS env var
  */
 
 import { createHelia } from "helia";
@@ -19,14 +21,10 @@ import { tcp } from "@libp2p/tcp";
 import { mdns } from "@libp2p/mdns";
 import { gossipsub } from "@chainsafe/libp2p-gossipsub";
 import { identify } from "@libp2p/identify";
-import { bootstrap } from "@libp2p/bootstrap";
-import { kadDHT, removePrivateAddressesMapper } from "@libp2p/kad-dht";
 import { ping } from "@libp2p/ping";
 import { FsBlockstore } from "blockstore-fs";
 import { FsDatastore } from "datastore-fs";
 import { createOrbitDB } from "@orbitdb/core";
-import { CID } from "multiformats/cid";
-import { base58btc } from "multiformats/bases/base58";
 import express from "express";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 
@@ -42,24 +40,12 @@ const ANNOUNCE_ADDRESS = process.env.ANNOUNCE_ADDRESS || "";
 const BOOTSTRAP_PEERS = process.env.ORBITDB_BOOTSTRAP_PEERS || "";
 const NODE_TTL_DAYS = parseInt(process.env.NODE_TTL_DAYS || "7", 10);
 
-// Public IPFS bootstrap nodes — entry points into the IPFS DHT.
-// Use all of them to maximise chances of populating the DHT routing table.
-// Bootstrap peers are entry points only — the DHT discovers closer peers
-// through routing table walks once connected.
-const IPFS_BOOTSTRAP_NODES = [
-  "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
-  "/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
-  "/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
-  "/dnsaddr/va1.bootstrap.libp2p.io/p2p/12D3KooWKnDdG3iXw9eTFijk3EWSunZcFi54Zka4wmtqtt6rPxc8",
-  "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
-];
-
 // Parse ORBITDB_BOOTSTRAP_PEERS — supports multiple formats:
-//   Full multiaddr: /ip4/203.0.113.1/tcp/4001/p2p/12D3KooW...
-//   IP:port:        203.0.113.1:4001
+//   Full multiaddr: /ip4/203.0.113.1/tcp/4002/p2p/12D3KooW...
+//   IP:port:        203.0.113.1:4002
 //   Just IP:        203.0.113.1  (uses LIBP2P_PORT)
 //   Hostname:       bootstrap.wesense.earth  (uses /dns4/)
-//   Hostname:port:  bootstrap.wesense.earth:4001
+//   Hostname:port:  bootstrap.wesense.earth:4002
 function parseBootstrapPeers(peersStr, defaultPort) {
   if (!peersStr) return [];
   return peersStr
@@ -82,111 +68,6 @@ function parseBootstrapPeers(peersStr, defaultPort) {
 
 const WESENSE_PEER_ADDRS = parseBootstrapPeers(BOOTSTRAP_PEERS, LIBP2P_PORT);
 
-const DISCOVERY_INTERVAL = 5 * 60_000; // Search for peers every 5 minutes
-const PROVIDE_INTERVAL = 30 * 60_000; // Re-announce to DHT every 30 minutes
-
-/**
- * DHT-based peer discovery for OrbitDB replication.
- *
- * OrbitDB replicates via GossipSub, which requires a direct libp2p
- * connection between peers. mDNS handles LAN discovery automatically
- * (when using network_mode: host). For WAN, we use the IPFS DHT as
- * a rendezvous: each station "provides" its OrbitDB database CIDs,
- * and periodically searches for other providers of the same CIDs.
- * When a new provider is found, we dial them — once connected,
- * GossipSub kicks in and OrbitDB replicates.
- */
-function startPeerDiscovery(helia, dbs) {
-  // Extract CIDs from OrbitDB database addresses (/orbitdb/zdpuAk...)
-  const dbCids = [dbs.nodes, dbs.trust, dbs.attestations].map((db) => {
-    const cidStr = db.address.toString().split("/").pop();
-    return CID.parse(cidStr, base58btc);
-  });
-
-  const provide = async () => {
-    for (const cid of dbCids) {
-      try {
-        await helia.routing.provide(cid, { signal: AbortSignal.timeout(30_000) });
-      } catch (err) {
-        console.warn(`DHT provide failed for ${cid}: ${err.message}`);
-      }
-    }
-    console.log("DHT: Provided database CIDs to IPFS network");
-  };
-
-  const discover = async () => {
-    const myPeerId = helia.libp2p.peerId;
-    const connectedPeers = new Set(helia.libp2p.getPeers().map((p) => p.toString()));
-
-    // Collect our own addresses so we can skip stale DHT records that
-    // point to us under an old peer ID (prevents "Can not dial self").
-    const myAddrs = new Set(
-      helia.libp2p.getMultiaddrs().map((a) => {
-        // Strip the /p2p/... suffix to match on IP:port only
-        const s = a.toString();
-        const idx = s.indexOf("/p2p/");
-        return idx >= 0 ? s.substring(0, idx) : s;
-      })
-    );
-
-    // Only need to search one database CID — all stations provide all three,
-    // so finding a provider for one means we'll connect and replicate all.
-    const cid = dbCids[0];
-    try {
-      for await (const provider of helia.routing.findProviders(cid, {
-        signal: AbortSignal.timeout(15_000),
-      })) {
-        if (provider.id.equals(myPeerId)) continue;
-        if (connectedPeers.has(provider.id.toString())) continue;
-
-        // Filter to raw TCP addresses only — skip HTTP gateways (/tls/http),
-        // QUIC, WebSocket, and peers with no addresses at all.
-        const tcpAddrs = (provider.multiaddrs || []).filter((a) => {
-          const s = a.toString();
-          return s.includes("/tcp/") && !s.includes("/tls/") && !s.includes("/ws") && !s.includes("/http");
-        });
-        if (tcpAddrs.length === 0) continue;
-
-        // Skip providers whose addresses match our own (stale DHT records
-        // from before we had persistent peer IDs)
-        const isOurself = tcpAddrs.every((a) => {
-          const s = a.toString();
-          const idx = s.indexOf("/p2p/");
-          const base = idx >= 0 ? s.substring(0, idx) : s;
-          return myAddrs.has(base);
-        });
-        if (isOurself) continue;
-
-        try {
-          await helia.libp2p.peerStore.merge(provider.id, {
-            multiaddrs: tcpAddrs,
-          });
-          await helia.libp2p.dial(provider.id);
-          console.log(`DHT: Connected to peer ${provider.id}`);
-        } catch (err) {
-          console.warn(`DHT: Failed to dial ${provider.id}: ${err.message}`);
-        }
-      }
-    } catch {
-      // Timeout or no providers found — normal, will retry
-    }
-  };
-
-  // Run initial provide + discover after a short delay (let libp2p settle)
-  setTimeout(async () => {
-    await provide();
-    await discover();
-  }, 10_000);
-
-  // Periodic re-provide (DHT records expire after ~24 hours)
-  setInterval(provide, PROVIDE_INTERVAL);
-
-  // Periodic discovery
-  setInterval(discover, DISCOVERY_INTERVAL);
-
-  console.log("DHT peer discovery started (provide every 30m, find every 5m)");
-}
-
 async function main() {
   // Ensure data directories exist
   await mkdir(`${DATA_DIR}/blockstore`, { recursive: true });
@@ -196,7 +77,7 @@ async function main() {
   const blockstore = new FsBlockstore(`${DATA_DIR}/blockstore`);
   const datastore = new FsDatastore(`${DATA_DIR}/datastore`);
 
-  // Announce the host's real IP/hostname so peers on other Docker hosts can reach us
+  // Announce the host's real IP/hostname so peers on other networks can reach us
   const announceProto = ANNOUNCE_ADDRESS && /^[\d.]+$/.test(ANNOUNCE_ADDRESS) ? "ip4" : "dns4";
   const announce = ANNOUNCE_ADDRESS
     ? [`/${announceProto}/${ANNOUNCE_ADDRESS}/tcp/${LIBP2P_PORT}`]
@@ -207,10 +88,6 @@ async function main() {
   const libp2pDatastore = new FsDatastore(`${DATA_DIR}/libp2p`);
 
   // Peer identity persistence — stable peer ID across restarts.
-  // Critical for DHT provider records and IPNS: if the peer ID changes,
-  // previous provider records become orphaned and IPNS names expire.
-  // We generate/load the key BEFORE creating libp2p because the private
-  // key is not exposed on the libp2p instance after creation.
   const keyPath = `${DATA_DIR}/peer_key`;
   let privateKey;
   try {
@@ -219,7 +96,6 @@ async function main() {
     privateKey = privateKeyFromProtobuf(keyBytes);
     console.log("Loaded persisted peer identity");
   } catch (err) {
-    // First run or corrupted key — generate a new one and save it
     try {
       const { generateKeyPair, privateKeyToProtobuf } = await import("@libp2p/crypto/keys");
       privateKey = await generateKeyPair("Ed25519");
@@ -242,42 +118,26 @@ async function main() {
     streamMuxers: [yamux()],
     transportManager: {
       // Don't crash if a listen address is temporarily in use (e.g. previous
-      // container still releasing port 4001 during restart). The service can
-      // still dial out; incoming connections resume on the next restart.
+      // container still releasing port during restart).
       faultTolerance: 1, // NO_FATAL
     },
     connectionManager: {
-      // Need enough connections for both WeSense OrbitDB replication AND
-      // IPFS DHT routing (content providing/discovery). Too low and the
-      // connection manager prunes DHT peers in favour of gossipsub-tagged
-      // WeSense peers, leaving a sparse routing table that makes content
-      // undiscoverable by public IPFS gateways. A well-connected DHT node
-      // typically needs 20-50+ peers for reliable provider record placement.
+      // WeSense-only network — every peer is another station running OrbitDB.
+      // At scale, thousands of stations may participate (Tier 2 producers +
+      // Tier 3 consumers). GossipSub handles fanout efficiently, but we need
+      // enough connections for healthy mesh topology and replication speed.
       minConnections: 20,
-      maxConnections: 100,
+      maxConnections: 300,
     },
     peerDiscovery: [
-      // Use a non-standard mDNS port to avoid conflict with avahi-daemon
-      // (or other host mDNS services) which exclusively bind port 5353.
-      // All WeSense stations use the same port so they discover each other.
+      // mDNS for automatic LAN discovery. Non-standard port to avoid conflict
+      // with avahi-daemon. All WeSense stations use the same port.
       mdns({ port: 5354 }),
-      bootstrap({ list: IPFS_BOOTSTRAP_NODES }),
     ],
     services: {
       identify: identify(),
       ping: ping(),
       pubsub: gossipsub({ allowPublishToZeroTopicPeers: true }),
-      // Amino DHT — the public IPFS Kademlia network for content discovery.
-      // Server mode when ANNOUNCE_ADDRESS is set (publicly reachable), otherwise
-      // client mode. Server mode serves DHT records, giving peers a reason to
-      // stay connected and making our provider records more discoverable.
-      // removePrivateAddressesMapper filters LAN IPs from DHT records so the
-      // routing table only contains publicly reachable peers (per Amino spec).
-      aminoDHT: kadDHT({
-        protocol: "/ipfs/kad/1.0.0",
-        clientMode: !ANNOUNCE_ADDRESS,
-        peerInfoMapper: removePrivateAddressesMapper,
-      }),
     },
   });
 
@@ -288,18 +148,16 @@ async function main() {
     console.log(`Configured peer addresses: ${WESENSE_PEER_ADDRS.join(", ")}`);
   }
 
-  // Explicitly dial any peer discovered via mDNS (or other discovery).
-  // We cannot rely on libp2p's auto-dialer because IPFS bootstrap peers
-  // fill the minConnections quota before mDNS-discovered WeSense stations
-  // get a chance. This ensures we always connect to LAN peers immediately.
+  // Dial peers discovered via mDNS. On this network every discovered peer
+  // is another WeSense station — there are no IPFS bootstrap nodes.
   helia.libp2p.addEventListener("peer:discovery", (evt) => {
     const discoveredId = evt.detail.id;
     if (helia.libp2p.getPeers().some((p) => p.equals(discoveredId))) return;
     helia.libp2p.dial(discoveredId).then(
-      () => console.log(`Discovery dial: Connected to ${discoveredId}`),
+      () => console.log(`mDNS: Connected to ${discoveredId}`),
       (err) => {
         if (!err.message?.includes("dial self")) {
-          console.warn(`Discovery dial: Failed ${discoveredId}: ${err.message}`);
+          console.warn(`mDNS: Failed to dial ${discoveredId}: ${err.message}`);
         }
       }
     );
@@ -321,29 +179,17 @@ async function main() {
   const dbs = await openDatabases(orbitdb);
   console.log(`Databases opened — nodes: ${dbs.nodes.address}, trust: ${dbs.trust.address}`);
 
-  // Diagnostic: verify gossipsub topic subscriptions after database open
-  const pubsubDiag = helia.libp2p.services.pubsub;
-  const subscribedTopics = pubsubDiag.getTopics ? pubsubDiag.getTopics() : [];
-  console.log(`GossipSub topics after DB open: [${subscribedTopics.join(", ")}]`);
-  console.log(`GossipSub started: ${pubsubDiag.status?.code ?? pubsubDiag.isStarted?.() ?? "unknown"}`);
-  for (const [name, db] of Object.entries(dbs)) {
-    console.log(`  ${name}: sync=${!!db.sync}, sync.peers=${db.sync?.peers?.size ?? "N/A"}`);
-  }
-
-  // Database replication event logging (join only — update events are too noisy)
+  // Database replication event logging
   for (const [name, db] of Object.entries(dbs)) {
     db.events.on("join", (peerId, heads) => {
       console.log(`[${name}] Peer joined DB: ${peerId} (${heads?.length || 0} heads)`);
     });
   }
 
-  // Replication trigger — when a WeSense peer connects (identified by
-  // gossipsub topic subscription), write a sync marker to force HEAD
-  // re-publication.  Only fires for actual WeSense stations sharing
-  // OrbitDB databases, NOT for IPFS bootstrap/DHT peers whose constant
-  // connect/disconnect churn was saturating the event loop.
+  // Replication trigger — when a WeSense peer connects, write a sync marker
+  // to force HEAD re-publication so the new peer gets current data.
   let lastSyncTrigger = 0;
-  const SYNC_DEBOUNCE = 60_000; // Max once per 60 seconds
+  const SYNC_DEBOUNCE = 60_000;
 
   const getWesensePeerCount = () => {
     const pubsub = helia.libp2p.services.pubsub;
@@ -378,14 +224,13 @@ async function main() {
     const now = Date.now();
     if (now - lastSyncTrigger < SYNC_DEBOUNCE) return;
     syncPending = true;
-    // Delay to let gossipsub subscriptions propagate, then check if
-    // any WeSense station is connected (topic subscriber)
+    // Delay to let gossipsub subscriptions propagate
     setTimeout(() => {
       syncPending = false;
       const wesensePeers = getWesensePeerCount();
       if (wesensePeers === 0) return;
       lastSyncTrigger = Date.now();
-      triggerSync(`wesense peer:connect, ${wesensePeers} WeSense peers`);
+      triggerSync(`peer:connect, ${wesensePeers} WeSense peers`);
     }, 10_000);
   });
 
@@ -397,7 +242,6 @@ async function main() {
   }, 10 * 60_000);
 
   // Node registry cleanup — remove entries not updated within NODE_TTL_DAYS.
-  // Runs every hour. Deleted entries replicate the deletion to other peers.
   const cleanupStaleNodes = async () => {
     try {
       const cutoff = Date.now() - NODE_TTL_DAYS * 24 * 60 * 60 * 1000;
@@ -419,19 +263,16 @@ async function main() {
       console.warn(`Node cleanup error: ${err.message}`);
     }
   };
-  // Run on startup after a delay, then every hour
   setTimeout(cleanupStaleNodes, 30_000);
   setInterval(cleanupStaleNodes, 60 * 60_000);
 
   // Direct peer dialing — for configured WeSense station addresses.
-  // Handles environments where mDNS doesn't work (Docker on TrueNAS, VMs).
-  // Accepts simple IPs, IP:port, or full multiaddrs via ORBITDB_BOOTSTRAP_PEERS.
+  // Handles WAN discovery where mDNS can't reach (different networks, VPS).
   if (WESENSE_PEER_ADDRS.length > 0) {
     const { multiaddr: createMa } = await import("@multiformats/multiaddr");
 
     const dialConfiguredPeers = async () => {
       for (const addr of WESENSE_PEER_ADDRS) {
-        // Skip if already connected to a peer at this address
         const targetHost = addr.match(/\/(?:ip4|dns4)\/([^/]+)\//)?.[1];
         if (targetHost) {
           const alreadyConnected = helia.libp2p
@@ -445,8 +286,6 @@ async function main() {
           await helia.libp2p.dial(ma);
           console.log(`Direct dial: Connected to ${addr}`);
         } catch (err) {
-          // "dial self" is normal when the same ORBITDB_BOOTSTRAP_PEERS is
-          // used across all stations — silently skip.
           if (!err.message?.includes("dial self")) {
             console.warn(`Direct dial: Failed ${addr}: ${err.message}`);
           }
@@ -454,31 +293,9 @@ async function main() {
       }
     };
 
-    // Initial dial after libp2p settles
     setTimeout(dialConfiguredPeers, 5_000);
-    // Periodic re-dial to handle reconnection after transient failures
     setInterval(dialConfiguredPeers, 60_000);
     console.log(`Direct peer dialing enabled for: ${WESENSE_PEER_ADDRS.join(", ")}`);
-  }
-
-  // Start DHT-based peer discovery for cross-station replication.
-  startPeerDiscovery(helia, dbs);
-
-  // Aggressively refresh the DHT routing table at startup and periodically.
-  // The default self-query interval populates the routing table over time,
-  // but with minConnections raised to 20 we want to fill the table faster
-  // so our provider records land on well-connected DHT peers. This makes
-  // archive CIDs discoverable by public IPFS gateways.
-  const dht = helia.libp2p.services.aminoDHT;
-  if (dht?.refreshRoutingTable) {
-    setTimeout(async () => {
-      try {
-        await dht.refreshRoutingTable();
-        console.log(`DHT: Routing table refreshed (${helia.libp2p.getPeers().length} peers)`);
-      } catch (err) {
-        console.warn(`DHT: Routing table refresh failed: ${err.message}`);
-      }
-    }, 15_000); // 15s after startup — let bootstrap connections establish first
   }
 
   // Express HTTP API
@@ -509,12 +326,10 @@ async function main() {
   };
   startServer();
 
-  // Graceful shutdown — force-exit after 8 seconds to stay within Docker's
-  // 10-second SIGTERM grace period. Without this, helia.stop() can hang
-  // indefinitely waiting on DHT/peer operations, leaving zombie processes.
+  // Graceful shutdown
   let shuttingDown = false;
   const shutdown = async () => {
-    if (shuttingDown) return; // Prevent double-shutdown from SIGINT + SIGTERM
+    if (shuttingDown) return;
     shuttingDown = true;
     console.log("Shutting down...");
 
@@ -522,7 +337,7 @@ async function main() {
       console.warn("Graceful shutdown timed out, forcing exit");
       process.exit(1);
     }, 8000);
-    forceExit.unref(); // Don't let the timer itself keep the process alive
+    forceExit.unref();
 
     try {
       if (httpServer) httpServer.close();
