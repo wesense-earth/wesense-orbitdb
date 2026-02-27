@@ -29,6 +29,7 @@ import express from "express";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 
 import { openDatabases } from "./databases.js";
+import { wrapHeliaForOrbitDB } from "./helia-compat.js";
 import { createNodesRouter } from "./routes/nodes.js";
 import { createTrustRouter } from "./routes/trust.js";
 import { createAttestationsRouter } from "./routes/attestations.js";
@@ -182,8 +183,14 @@ async function main() {
     console.log(`Peer disconnected: ${evt.detail.toString()}`);
   });
 
+  // Helia v6 changed blockstore.get() to return AsyncGenerator<Uint8Array>
+  // (streaming blockstores). OrbitDB @3.0.2 expects plain Uint8Array returns.
+  // Wrap helia so OrbitDB gets the non-streaming API it needs.
+  // See: https://github.com/orbitdb/orbitdb/issues/1244
+  const heliaForOrbitDB = wrapHeliaForOrbitDB(helia);
+
   const orbitdb = await createOrbitDB({
-    ipfs: helia,
+    ipfs: heliaForOrbitDB,
     directory: `${DATA_DIR}/orbitdb`,
   });
 
