@@ -141,7 +141,18 @@ async function main() {
     },
   });
 
-  const helia = await createHelia({ libp2p, blockstore, datastore });
+  // Helia defaults add trustlessGateway(), httpGatewayRouting(), and
+  // libp2pRouting() which connect to the public IPFS network. Disable all
+  // of them — this is a private WeSense network. We keep bitswap() because
+  // OrbitDB uses helia.blockstore for IPFS block storage/retrieval between peers.
+  const { bitswap } = await import("@helia/block-brokers");
+  const helia = await createHelia({
+    libp2p,
+    blockstore,
+    datastore,
+    blockBrokers: [bitswap()],
+    routers: [],
+  });
   console.log(`Helia peer ID: ${helia.libp2p.peerId.toString()}`);
   console.log(`Announced addresses: ${helia.libp2p.getMultiaddrs().map((a) => a.toString()).join(", ")}`);
   if (WESENSE_PEER_ADDRS.length > 0) {
