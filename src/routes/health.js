@@ -216,6 +216,19 @@ export function createHealthRouter({ helia, dbs }) {
         result.connectionStatus = conns[0].status;
         result.connectionDirection = conns[0].direction;
 
+        // Intercept gossipsub's internal error logging to capture the error
+        let capturedErrors = [];
+        const origLogError = pubsub.log?.error;
+        if (origLogError) {
+          pubsub.log.error = (...args) => {
+            capturedErrors.push(args.map((a) => {
+              if (a instanceof Error) return { message: a.message, name: a.name, code: a.code, stack: a.stack?.split("\n").slice(0, 3).join("\n") };
+              return String(a);
+            }));
+            return origLogError.apply(pubsub.log, args);
+          };
+        }
+
         try {
           await pubsub.createOutboundStream(peerId, conns[0]);
           result.afterCreate_hasOutbound =
@@ -228,6 +241,14 @@ export function createHealthRouter({ helia, dbs }) {
           result.error = err.message;
           result.errorName = err.name;
           result.errorCode = err.code;
+        }
+
+        // Restore original log.error
+        if (origLogError) {
+          pubsub.log.error = origLogError;
+        }
+        if (capturedErrors.length > 0) {
+          result.gossipsub_errors = capturedErrors;
         }
 
         results.push(result);
