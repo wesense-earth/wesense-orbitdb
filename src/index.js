@@ -13,6 +13,9 @@
  *   - WAN: Direct dial via ORBITDB_BOOTSTRAP_PEERS env var
  */
 
+// Must be imported before any helia/libp2p code to patch stream prototypes.
+import "./libp2p-stream-compat.js";
+
 import { createHelia } from "helia";
 import { createLibp2p } from "libp2p";
 import { noise } from "@chainsafe/libp2p-noise";
@@ -145,22 +148,6 @@ async function main() {
       pubsub: gossipsub({ allowPublishToZeroTopicPeers: true }),
     },
   });
-
-  // Workaround: gossipsub@14 registers 3 multicodecs (/meshsub/1.2.0, 1.1.0,
-  // 1.0.0). When connection.newStream() is called with multiple protocols,
-  // libp2p@3 uses multistream-select (MSS) negotiation instead of early
-  // protocol negotiation. MSS negotiation appears to fail silently in this
-  // version combination, preventing gossipsub from creating outbound streams.
-  //
-  // By restricting to a single protocol, newStream() uses early negotiation
-  // (protocol pre-selected at yamux stream creation), bypassing MSS entirely.
-  // All WeSense nodes run the same stack, so backward compat isn't needed.
-  const pubsubService = libp2p.services.pubsub;
-  if (pubsubService.multicodecs) {
-    console.log(`Gossipsub multicodecs before: ${pubsubService.multicodecs.join(", ")}`);
-    pubsubService.multicodecs = ["/meshsub/1.2.0"];
-    console.log(`Gossipsub multicodecs after: ${pubsubService.multicodecs.join(", ")}`);
-  }
 
   // Helia defaults add trustlessGateway(), httpGatewayRouting(), and
   // libp2pRouting() which connect to the public IPFS network. Disable all
