@@ -262,8 +262,12 @@ async function main() {
       if (!pubsub.peers?.has(id)) {
         const conns = helia.libp2p.getConnections(peerId);
         if (conns.length > 0) {
-          pubsub.addPeer?.(peerId, conns[0].direction, conns[0].remoteAddr);
-          console.log(`Gossipsub: manually added peer ${id}`);
+          try {
+            pubsub.addPeer?.(peerId, conns[0].direction, conns[0].remoteAddr);
+            console.log(`Gossipsub: manually added peer ${id}`);
+          } catch (err) {
+            console.warn(`Gossipsub: addPeer failed for ${id}: ${err.message}`);
+          }
         }
       }
       const conns = helia.libp2p.getConnections(peerId);
