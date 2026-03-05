@@ -42,10 +42,18 @@ export function createAttestationsRouter(attestationsDb) {
         });
       }
 
+      // Preserve iroh_blake3_hash and path from request body or existing doc
+      const existingDoc = existing && existing.length > 0 ? existing[0].value : {};
+      const iroh_blake3_hash =
+        req.body.iroh_blake3_hash || existingDoc.iroh_blake3_hash || null;
+      const path = req.body.path || existingDoc.path || null;
+
       const doc = {
         _id: manifest_hash,
         manifest_hash,
         attestations,
+        iroh_blake3_hash,
+        path,
         updated_at: new Date().toISOString(),
       };
       await attestationsDb.put(doc);
