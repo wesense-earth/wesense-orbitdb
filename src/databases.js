@@ -19,7 +19,7 @@ import { IPFSAccessController } from "@orbitdb/core";
  * Open (or create) the three WeSense OrbitDB databases.
  *
  * @param {import("@orbitdb/core").OrbitDB} orbitdb
- * @returns {Promise<{nodes: object, trust: object, attestations: object}>}
+ * @returns {Promise<{nodes: object, trust: object, attestations: object, stores: object}>}
  */
 export async function openDatabases(orbitdb) {
   const opts = {
@@ -30,6 +30,7 @@ export async function openDatabases(orbitdb) {
   const nodes = await orbitdb.open("wesense.nodes", opts);
   const trust = await orbitdb.open("wesense.trust", opts);
   const attestations = await orbitdb.open("wesense.attestations", opts);
+  const stores = await orbitdb.open("wesense.stores", opts);
 
-  return { nodes, trust, attestations };
+  return { nodes, trust, attestations, stores };
 }
