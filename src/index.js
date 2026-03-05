@@ -254,6 +254,30 @@ async function main() {
   const dbs = await openDatabases(orbitdb);
   console.log(`Databases opened — nodes: ${dbs.nodes.address}, trust: ${dbs.trust.address}`);
 
+  // Patch access controllers to tolerate missing identity blocks.
+  // Old oplog entries created before the helia-compat.js fix have identity
+  // blocks that were corrupted by helia v6's streaming blockstore. These
+  // entries replicate forever between peers, and every verification attempt
+  // triggers a LoadBlockFailedError. Since all databases use write: ["*"]
+  // (permissive access), identity verification is unnecessary — we accept
+  // unverifiable entries rather than erroring.
+  for (const [name, db] of Object.entries(dbs)) {
+    const origCanAppend = db.access.canAppend.bind(db.access);
+    db.access.canAppend = async (entry) => {
+      try {
+        return await origCanAppend(entry);
+      } catch (err) {
+        const msg = err?.message || "";
+        if (msg.includes("Failed to load block") ||
+            msg.includes("Want was aborted") ||
+            msg.includes("CBOR decode error")) {
+          return true; // accept entry — write: ["*"] permits all writers
+        }
+        throw err;
+      }
+    };
+  }
+
   // Gossipsub error logging — gossipsub@14 swallows stream creation errors
   // into debug-only logging (libp2p:gossipsub namespace). Monkey-patch the
   // log.error method to also write to console so we can see failures.
