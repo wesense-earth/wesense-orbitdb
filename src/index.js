@@ -36,6 +36,7 @@ import { wrapHeliaForOrbitDB } from "./helia-compat.js";
 import { createNodesRouter } from "./routes/nodes.js";
 import { createTrustRouter } from "./routes/trust.js";
 import { createAttestationsRouter } from "./routes/attestations.js";
+import { createStoresRouter } from "./routes/stores.js";
 import { createHealthRouter } from "./routes/health.js";
 const PORT = parseInt(process.env.PORT || "5200", 10);
 const LIBP2P_PORT = parseInt(process.env.LIBP2P_PORT || "4002", 10);
@@ -414,6 +415,7 @@ async function main() {
   app.use("/nodes", createNodesRouter(dbs.nodes));
   app.use("/trust", createTrustRouter(dbs.trust));
   app.use("/attestations", createAttestationsRouter(dbs.attestations));
+  app.use("/stores", createStoresRouter(dbs.stores));
   app.use("/health", createHealthRouter({ helia, dbs }));
 
   // Retry listen — with network_mode: host the previous container may not
@@ -453,6 +455,7 @@ async function main() {
       await dbs.nodes.close();
       await dbs.trust.close();
       await dbs.attestations.close();
+      await dbs.stores.close();
       await orbitdb.stop();
       await helia.stop();
     } catch (err) {
