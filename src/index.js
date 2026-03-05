@@ -38,19 +38,36 @@ import { createTrustRouter } from "./routes/trust.js";
 import { createAttestationsRouter } from "./routes/attestations.js";
 import { createStoresRouter } from "./routes/stores.js";
 import { createHealthRouter } from "./routes/health.js";
-// OrbitDB's sync module can throw errors that escape its try/catch when
-// pipe() doesn't properly propagate async generator errors (CBOR decode
-// failures, LoadBlockFailedError). These surface as uncaught exceptions
-// or unhandled rejections. Log and continue — sync retries automatically.
+// OrbitDB's sync module emits errors via EventEmitter and also throws errors
+// that escape pipe()/try-catch as uncaught exceptions or unhandled rejections.
+// Known transient errors that should not crash the process:
+//   - CBOR decode error: corrupt oplog entry from peer
+//   - LoadBlockFailedError / Failed to load block: IPFS block not on any peer
+//   - Want was aborted: bitswap request timed out
+//   - StreamResetError / stream has been reset: yamux stream reset mid-sync
+//   - UnexpectedEOFError / Unexpected EOF: peer disconnected during protocol negotiation
+//   - connection reset by peer / ECONNRESET: TCP-level disconnect
+// All are transient — sync retries automatically on next peer connection.
+const KNOWN_SYNC_ERRORS = [
+  "CBOR decode error",
+  "Failed to load block",
+  "Want was aborted",
+  "stream has been reset",
+  "Unexpected EOF",
+  "connection reset by peer",
+  "ECONNRESET",
+  "The operation was aborted",
+  "stream closed",
+];
+
+function isKnownSyncError(err) {
+  const msg = err?.message || String(err);
+  return KNOWN_SYNC_ERRORS.some((pattern) => msg.includes(pattern));
+}
+
 process.on("uncaughtException", (err) => {
-  // Only swallow known OrbitDB sync errors. Rethrow everything else.
-  const msg = err.message || "";
-  if (
-    msg.includes("CBOR decode error") ||
-    msg.includes("Failed to load block") ||
-    msg.includes("Want was aborted")
-  ) {
-    console.warn(`OrbitDB sync error (uncaught, non-fatal): ${msg}`);
+  if (isKnownSyncError(err)) {
+    console.warn(`OrbitDB sync error (uncaught, non-fatal): ${err.message}`);
     return;
   }
   console.error("Uncaught exception:", err);
@@ -58,13 +75,8 @@ process.on("uncaughtException", (err) => {
 });
 
 process.on("unhandledRejection", (reason) => {
-  const msg = reason?.message || String(reason);
-  if (
-    msg.includes("CBOR decode error") ||
-    msg.includes("Failed to load block") ||
-    msg.includes("Want was aborted")
-  ) {
-    console.warn(`OrbitDB sync error (unhandled rejection, non-fatal): ${msg}`);
+  if (isKnownSyncError(reason)) {
+    console.warn(`OrbitDB sync error (unhandled rejection, non-fatal): ${reason?.message || reason}`);
     return;
   }
   console.error("Unhandled rejection:", reason);
