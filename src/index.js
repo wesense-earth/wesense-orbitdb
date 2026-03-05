@@ -38,6 +38,39 @@ import { createTrustRouter } from "./routes/trust.js";
 import { createAttestationsRouter } from "./routes/attestations.js";
 import { createStoresRouter } from "./routes/stores.js";
 import { createHealthRouter } from "./routes/health.js";
+// OrbitDB's sync module can throw errors that escape its try/catch when
+// pipe() doesn't properly propagate async generator errors (CBOR decode
+// failures, LoadBlockFailedError). These surface as uncaught exceptions
+// or unhandled rejections. Log and continue — sync retries automatically.
+process.on("uncaughtException", (err) => {
+  // Only swallow known OrbitDB sync errors. Rethrow everything else.
+  const msg = err.message || "";
+  if (
+    msg.includes("CBOR decode error") ||
+    msg.includes("Failed to load block") ||
+    msg.includes("Want was aborted")
+  ) {
+    console.warn(`OrbitDB sync error (uncaught, non-fatal): ${msg}`);
+    return;
+  }
+  console.error("Uncaught exception:", err);
+  process.exit(1);
+});
+
+process.on("unhandledRejection", (reason) => {
+  const msg = reason?.message || String(reason);
+  if (
+    msg.includes("CBOR decode error") ||
+    msg.includes("Failed to load block") ||
+    msg.includes("Want was aborted")
+  ) {
+    console.warn(`OrbitDB sync error (unhandled rejection, non-fatal): ${msg}`);
+    return;
+  }
+  console.error("Unhandled rejection:", reason);
+  process.exit(1);
+});
+
 const PORT = parseInt(process.env.PORT || "5200", 10);
 const LIBP2P_PORT = parseInt(process.env.LIBP2P_PORT || "4002", 10);
 const DATA_DIR = process.env.DATA_DIR || "./data";
