@@ -289,10 +289,21 @@ async function main() {
   setTimeout(ensureGossipsubStreams, 15_000);
   setTimeout(ensureGossipsubStreams, 30_000);
 
-  // Database replication event logging
+  // Database replication event logging + error handling.
+  // OrbitDB's sync module emits 'error' events when blocks can't be loaded
+  // (peer offline, bitswap timeout) or when received data fails CBOR decode
+  // (corrupt oplog entry, incompatible peer). Without a handler these crash
+  // the process as unhandled EventEmitter errors.
   for (const [name, db] of Object.entries(dbs)) {
     db.events.on("join", (peerId, heads) => {
       console.log(`[${name}] Peer joined DB: ${peerId} (${heads?.length || 0} heads)`);
+    });
+    db.events.on("error", (err) => {
+      // Log but don't crash — sync will retry on the next peer connection
+      // or periodic trigger. Common errors:
+      //   - LoadBlockFailedError: block not available on any connected peer
+      //   - CBOR decode error: corrupt or incompatible oplog entry from peer
+      console.warn(`[${name}] Sync error (non-fatal): ${err.message}`);
     });
   }
 
