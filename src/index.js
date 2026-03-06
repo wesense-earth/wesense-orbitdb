@@ -358,6 +358,12 @@ async function main() {
   setTimeout(ensureGossipsubStreams, 15_000);
   setTimeout(ensureGossipsubStreams, 30_000);
 
+  // Also run gossipsub fix when a peer (re)connects — handles bootstrap
+  // disconnect/reconnect race where the initial fix attempts have already fired.
+  helia.libp2p.addEventListener("peer:connect", () => {
+    setTimeout(ensureGossipsubStreams, 3_000);
+  });
+
   // Database replication event logging + error handling.
   // OrbitDB's sync module emits 'error' events when blocks can't be loaded
   // (peer offline, bitswap timeout) or when received data fails CBOR decode
