@@ -12,6 +12,10 @@ import { Router } from "express";
 /**
  * @param {object} trustDb - OrbitDB Documents database (indexBy: ingester_id)
  */
+const MAX_ID_LENGTH = 256;
+const MAX_PUBLIC_KEY_LENGTH = 512;
+const MAX_VERSIONS = 20;
+
 export function createTrustRouter(trustDb) {
   const router = Router();
 
@@ -19,10 +23,19 @@ export function createTrustRouter(trustDb) {
   router.put("/:ingester_id", async (req, res) => {
     try {
       const ingester_id = req.params.ingester_id;
-      const { public_key, key_version, status, ...rest } = req.body;
+      if (ingester_id.length > MAX_ID_LENGTH) {
+        return res.status(400).json({ error: "ID too long" });
+      }
+      const { public_key, key_version, status } = req.body;
 
       if (!public_key || key_version === undefined) {
         return res.status(400).json({ error: "public_key and key_version are required" });
+      }
+      if (typeof public_key !== "string" || public_key.length > MAX_PUBLIC_KEY_LENGTH) {
+        return res.status(400).json({ error: "Invalid public_key" });
+      }
+      if (typeof key_version !== "number" && typeof key_version !== "string") {
+        return res.status(400).json({ error: "Invalid key_version" });
       }
 
       // Fetch existing entry to merge versions
@@ -32,11 +45,14 @@ export function createTrustRouter(trustDb) {
         versions = { ...existing[0].value.versions };
       }
 
+      if (Object.keys(versions).length >= MAX_VERSIONS && !(String(key_version) in versions)) {
+        return res.status(400).json({ error: "Too many key versions" });
+      }
+
       versions[String(key_version)] = {
         public_key,
         status: status || "active",
         added: new Date().toISOString(),
-        ...rest,
       };
 
       const doc = {
@@ -49,7 +65,7 @@ export function createTrustRouter(trustDb) {
       res.json({ ok: true, ingester_id });
     } catch (err) {
       console.error("PUT /trust/:ingester_id error:", err);
-      res.status(500).json({ error: err.message });
+      res.status(500).json({ error: "Internal error" });
     }
   });
 
@@ -68,13 +84,16 @@ export function createTrustRouter(trustDb) {
       res.json({ keys });
     } catch (err) {
       console.error("GET /trust error:", err);
-      res.status(500).json({ error: err.message });
+      res.status(500).json({ error: "Internal error" });
     }
   });
 
   // Get specific trust entry
   router.get("/:ingester_id", async (req, res) => {
     try {
+      if (req.params.ingester_id.length > MAX_ID_LENGTH) {
+        return res.status(400).json({ error: "ID too long" });
+      }
       const doc = await trustDb.get(req.params.ingester_id);
       if (!doc || doc.length === 0) {
         return res.status(404).json({ error: "not found" });
@@ -82,7 +101,7 @@ export function createTrustRouter(trustDb) {
       res.json(doc[0].value);
     } catch (err) {
       console.error("GET /trust/:ingester_id error:", err);
-      res.status(500).json({ error: err.message });
+      res.status(500).json({ error: "Internal error" });
     }
   });
 
@@ -90,6 +109,9 @@ export function createTrustRouter(trustDb) {
   router.delete("/:ingester_id", async (req, res) => {
     try {
       const ingester_id = req.params.ingester_id;
+      if (ingester_id.length > MAX_ID_LENGTH) {
+        return res.status(400).json({ error: "ID too long" });
+      }
       const existing = await trustDb.get(ingester_id);
       if (!existing || existing.length === 0) {
         return res.status(404).json({ error: "not found" });
@@ -112,7 +134,7 @@ export function createTrustRouter(trustDb) {
       res.json({ ok: true, revoked: ingester_id });
     } catch (err) {
       console.error("DELETE /trust/:ingester_id error:", err);
-      res.status(500).json({ error: err.message });
+      res.status(500).json({ error: "Internal error" });
     }
   });
 

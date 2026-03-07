@@ -16,13 +16,19 @@
 
 /**
  * Collect an async iterable of Uint8Array chunks into a single Uint8Array.
+ * Enforces a size limit to prevent OOM from malicious peers sending huge blocks.
  */
+const MAX_BLOCK_SIZE = 16 * 1024 * 1024; // 16MB — OrbitDB entries are small; this is generous
+
 async function collectBytes(source) {
   const chunks = [];
   let totalLength = 0;
   for await (const chunk of source) {
-    chunks.push(chunk);
     totalLength += chunk.byteLength;
+    if (totalLength > MAX_BLOCK_SIZE) {
+      throw new Error(`Block exceeds maximum size of ${MAX_BLOCK_SIZE} bytes`);
+    }
+    chunks.push(chunk);
   }
   if (chunks.length === 0) return new Uint8Array(0);
   if (chunks.length === 1) return chunks[0];
