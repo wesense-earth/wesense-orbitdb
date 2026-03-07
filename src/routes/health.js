@@ -78,8 +78,18 @@ export function createHealthRouter({ helia, dbs }) {
     }
   });
 
-  // Temporary diagnostic endpoint to debug gossipsub stream establishment.
+  // Diagnostic endpoints — only accessible from localhost/Docker network.
+  // Block access from external IPs to prevent information disclosure.
+  const isLocalRequest = (req) => {
+    const ip = req.ip || req.connection?.remoteAddress || "";
+    return ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1" ||
+           ip.startsWith("172.") || ip.startsWith("10.") || ip.startsWith("192.168.");
+  };
+
   router.get("/debug", async (req, res) => {
+    if (!isLocalRequest(req)) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
     try {
       const pubsub = helia.libp2p.services.pubsub;
       const connectedPeers = helia.libp2p.getPeers();
@@ -169,13 +179,16 @@ export function createHealthRouter({ helia, dbs }) {
       });
     } catch (err) {
       console.error("GET /health/debug error:", err);
-      res.status(500).json({ error: err.message, stack: err.stack });
+      res.status(500).json({ error: "Internal error" });
     }
   });
 
   // Diagnostic: directly attempt to create gossipsub outbound streams and
   // return step-by-step results. This bypasses gossipsub's internal queue.
   router.get("/fix-gossipsub", async (req, res) => {
+    if (!isLocalRequest(req)) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
     try {
       const pubsub = helia.libp2p.services.pubsub;
       const connectedPeers = helia.libp2p.getPeers();
@@ -274,7 +287,7 @@ export function createHealthRouter({ helia, dbs }) {
           : [],
       });
     } catch (err) {
-      res.status(500).json({ error: err.message, stack: err.stack });
+      res.status(500).json({ error: "Internal error" });
     }
   });
 

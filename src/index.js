@@ -169,7 +169,10 @@ async function main() {
     },
     transports: [tcp()],
     connectionEncrypters: [noise()],
-    streamMuxers: [yamux()],
+    streamMuxers: [yamux({
+      maxInboundStreams: 256,
+      maxOutboundStreams: 256,
+    })],
     transportManager: {
       // Don't crash if a listen address is temporarily in use (e.g. previous
       // container still releasing port during restart).
@@ -182,6 +185,8 @@ async function main() {
       // enough connections for healthy mesh topology and replication speed.
       minConnections: 20,
       maxConnections: 300,
+      // Limit inbound connections to prevent resource exhaustion from internet scans
+      maxIncomingPendingConnections: 50,
     },
     peerDiscovery: [
       // mDNS for automatic LAN discovery. Non-standard port to avoid conflict
@@ -191,7 +196,10 @@ async function main() {
     services: {
       identify: identify(),
       ping: ping(),
-      pubsub: gossipsub({ allowPublishToZeroTopicPeers: true }),
+      pubsub: gossipsub({
+        allowPublishToZeroTopicPeers: true,
+        maxInboundDataLength: 2 * 1024 * 1024, // 2MB — reject oversized gossipsub messages
+      }),
     },
   });
 
@@ -494,9 +502,10 @@ async function main() {
     console.log(`Direct peer dialing enabled for: ${WESENSE_PEER_ADDRS.join(", ")}`);
   }
 
-  // Express HTTP API
+  // Express HTTP API — only accessible from Docker network (port 5200),
+  // but harden anyway since network_mode: host exposes it on all interfaces.
   const app = express();
-  app.use(express.json());
+  app.use(express.json({ limit: "100kb" }));
 
   app.use("/nodes", createNodesRouter(dbs.nodes));
   app.use("/trust", createTrustRouter(dbs.trust));
