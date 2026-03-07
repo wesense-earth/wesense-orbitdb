@@ -445,6 +445,26 @@ async function main() {
     await triggerSync(`periodic, ${wesensePeers} WeSense peers`);
   }, 10 * 60_000);
 
+  // Periodic resource telemetry — logs memory, connections, and stream counts
+  // so we can diagnose resource pressure from container logs after a crash.
+  const logResourceStats = () => {
+    const mem = process.memoryUsage();
+    const peers = helia.libp2p.getPeers();
+    const conns = helia.libp2p.getConnections();
+    const pubsub = helia.libp2p.services.pubsub;
+    const outbound = pubsub.streamsOutbound?.size ?? 0;
+    const inbound = pubsub.streamsInbound?.size ?? 0;
+    console.log(
+      `RESOURCES | rss=${(mem.rss / 1048576).toFixed(0)}MB ` +
+      `heap=${(mem.heapUsed / 1048576).toFixed(0)}/${(mem.heapTotal / 1048576).toFixed(0)}MB ` +
+      `external=${(mem.external / 1048576).toFixed(1)}MB | ` +
+      `peers=${peers.length} conns=${conns.length} ` +
+      `streams_out=${outbound} streams_in=${inbound}`
+    );
+  };
+  setInterval(logResourceStats, 60_000);
+  setTimeout(logResourceStats, 10_000); // first report shortly after startup
+
   // Node registry cleanup — remove entries not updated within NODE_TTL_DAYS.
   const cleanupStaleNodes = async () => {
     try {
