@@ -254,46 +254,49 @@ async function main() {
   // See: https://github.com/orbitdb/orbitdb/issues/1244
   const heliaForOrbitDB = wrapHeliaForOrbitDB(helia);
 
-  const orbitdb = await createOrbitDB({
-    ipfs: heliaForOrbitDB,
-    directory: `${DATA_DIR}/orbitdb`,
-  });
-
-  const dbs = await openDatabases(orbitdb);
-  console.log(`Databases opened — nodes: ${dbs.nodes.address}, trust: ${dbs.trust.address}`);
-
-  // Self-healing: detect and clear orphaned oplog heads.
+  // Self-healing: detect and clear orphaned oplog heads BEFORE opening databases.
   // If the blockstore was wiped (e.g. migration, disk failure) but oplog head
   // pointers in LevelDB survived, OrbitDB enters an infinite loop: every peer
   // sync tries to fetch the missing blocks via bitswap, times out after 30s,
   // disconnects, reconnects, and retries — leaking memory until OOM.
-  // Fix: read head pointers from LevelDB, check each block exists in the LOCAL
-  // FsBlockstore (no bitswap/network). If missing, clear the database's oplog
-  // so it starts fresh and replicates cleanly from peers.
+  // Fix: scan for all heads LevelDBs, check each block exists in the LOCAL
+  // FsBlockstore (no bitswap/network). If missing, clear the heads and index
+  // so the database starts fresh and replicates cleanly from peers.
+  // Must run BEFORE openDatabases() — once OrbitDB opens the LevelDB, it holds
+  // an exclusive lock and we can't open a second reader.
   {
     const { CID } = await import("multiformats/cid");
     const { base58btc } = await import("multiformats/bases/base58");
     const { LevelStorage } = await import("@orbitdb/core");
+    const { readdir } = await import("node:fs/promises");
 
-    for (const [name, db] of Object.entries(dbs)) {
+    // Find all database directories that have a log/_heads/ subdirectory
+    const orbitdbDir = `${DATA_DIR}/orbitdb/orbitdb`;
+    let dbDirs = [];
+    try {
+      const entries = await readdir(orbitdbDir);
+      dbDirs = entries.map((e) => ({ name: e, basePath: `${orbitdbDir}/${e}` }));
+    } catch {
+      // No orbitdb directory yet — first start, nothing to check
+    }
+
+    for (const { name, basePath } of dbDirs) {
+      const headsPath = `${basePath}/log/_heads/`;
       try {
-        // Read raw head pointers directly from the heads LevelDB.
-        // We cannot use db.log.heads() because that loads full entries via
-        // IPFSBlockStorage, which triggers bitswap for missing blocks.
-        // Path must match OrbitDB's internal path construction:
-        //   pathJoin(orbitdb.directory, `./${address}/`, '/log/_heads/')
-        //   → ${DATA_DIR}/orbitdb/${address}/log/_heads/
-        const addr = db.address.toString().replace(/^\//, "");
-        const headsPath = `${DATA_DIR}/orbitdb/${addr}/log/_heads/`;
         const headsLevel = await LevelStorage({ path: headsPath });
         const decoder = new TextDecoder();
         const rawBytes = await headsLevel.get("heads");
-        await headsLevel.close();
 
-        if (!rawBytes) continue;
+        if (!rawBytes) {
+          await headsLevel.close();
+          continue;
+        }
 
         const headPointers = JSON.parse(decoder.decode(rawBytes));
-        if (headPointers.length === 0) continue;
+        if (headPointers.length === 0) {
+          await headsLevel.close();
+          continue;
+        }
 
         // Check each head's block in the local FsBlockstore (no network)
         let orphaned = false;
@@ -302,31 +305,49 @@ async function main() {
             const cid = CID.parse(hash, base58btc);
             const exists = await blockstore.has(cid);
             if (!exists) {
-              console.warn(`[${name}] Orphaned head detected: ${hash.slice(0, 16)}... not in local blockstore`);
+              console.warn(`[${name.slice(0, 12)}] Orphaned head: ${hash.slice(0, 16)}... not in local blockstore`);
               orphaned = true;
               break;
             }
           } catch (err) {
-            console.warn(`[${name}] Error checking head ${hash.slice(0, 16)}...: ${err.message}`);
+            console.warn(`[${name.slice(0, 12)}] Error checking head ${hash.slice(0, 16)}...: ${err.message}`);
             orphaned = true;
             break;
           }
         }
 
         if (orphaned) {
-          await db.log.clear();
-          console.log(`[${name}] Cleared orphaned oplog — database will replicate fresh from peers`);
+          // Clear the heads — removes the pointers so OrbitDB starts with no heads
+          await headsLevel.del("heads");
+          console.log(`[${name.slice(0, 12)}] Cleared orphaned heads — will replicate fresh from peers`);
+
+          // Also clear the index LevelDB so it stays consistent with empty heads
+          const indexPath = `${basePath}/log/_index/`;
+          try {
+            const indexLevel = await LevelStorage({ path: indexPath });
+            await indexLevel.clear();
+            await indexLevel.close();
+          } catch {}
         } else {
-          console.log(`[${name}] Head integrity OK (${headPointers.length} heads verified locally)`);
+          console.log(`[${name.slice(0, 12)}] Head integrity OK (${headPointers.length} heads)`);
         }
+
+        await headsLevel.close();
       } catch (err) {
-        // If the heads LevelDB doesn't exist or is empty, that's fine — new database
         if (!err.message?.includes("ENOENT")) {
-          console.warn(`[${name}] Head integrity check error: ${err.message}`);
+          console.warn(`[${name.slice(0, 12)}] Head integrity check error: ${err.message}`);
         }
       }
     }
   }
+
+  const orbitdb = await createOrbitDB({
+    ipfs: heliaForOrbitDB,
+    directory: `${DATA_DIR}/orbitdb`,
+  });
+
+  const dbs = await openDatabases(orbitdb);
+  console.log(`Databases opened — nodes: ${dbs.nodes.address}, trust: ${dbs.trust.address}`);
 
   // Patch access controllers to tolerate missing identity blocks.
   // Old oplog entries created before the helia-compat.js fix have identity
