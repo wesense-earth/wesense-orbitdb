@@ -2,7 +2,7 @@
  * WeSense OrbitDB Service
  *
  * Helia (libp2p) + OrbitDB + Express HTTP API for distributed
- * node registration, trust list sync, and archive attestations.
+ * node registration, trust list sync, and store scope tracking.
  *
  * This is a WeSense-only P2P network on port 4002 for sharing live
  * state between stations. It is NOT connected to the public IPFS
@@ -35,7 +35,6 @@ import { openDatabases } from "./databases.js";
 import { wrapHeliaForOrbitDB } from "./helia-compat.js";
 import { createNodesRouter } from "./routes/nodes.js";
 import { createTrustRouter } from "./routes/trust.js";
-import { createAttestationsRouter } from "./routes/attestations.js";
 import { createStoresRouter } from "./routes/stores.js";
 import { createHealthRouter } from "./routes/health.js";
 // OrbitDB's sync module emits errors via EventEmitter and also throws errors
@@ -341,6 +340,20 @@ async function main() {
     }
   }
 
+  // Clean up retired attestations database directory if it still exists on disk.
+  // wesense.attestations was removed from OrbitDB (moved to iroh sidecar path
+  // index exchange) but its LevelDB data may persist from previous deployments.
+  {
+    const { rm } = await import("node:fs/promises");
+    const attestationsDir = `${DATA_DIR}/orbitdb/orbitdb/zdpuAyzsJLK74DoVEQNzW9yyyL3Zfr8AEPc1dJZz2Kd8rvHX2`;
+    try {
+      await rm(attestationsDir, { recursive: true, force: true });
+      console.log("Cleaned up retired attestations database directory");
+    } catch {
+      // Directory doesn't exist or already cleaned — fine
+    }
+  }
+
   const orbitdb = await createOrbitDB({
     ipfs: heliaForOrbitDB,
     directory: `${DATA_DIR}/orbitdb`,
@@ -616,7 +629,6 @@ async function main() {
 
   app.use("/nodes", createNodesRouter(dbs.nodes));
   app.use("/trust", createTrustRouter(dbs.trust));
-  app.use("/attestations", createAttestationsRouter(dbs.attestations));
   app.use("/stores", createStoresRouter(dbs.stores));
   app.use("/health", createHealthRouter({ helia, dbs }));
 
@@ -656,7 +668,6 @@ async function main() {
       if (httpServer) httpServer.close();
       await dbs.nodes.close();
       await dbs.trust.close();
-      await dbs.attestations.close();
       await dbs.stores.close();
       await orbitdb.stop();
       await helia.stop();

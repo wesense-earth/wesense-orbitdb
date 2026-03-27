@@ -16,7 +16,7 @@ export function createHealthRouter({ helia, dbs }) {
   const router = Router();
 
   // Maintain document counts via events instead of calling .all() per request.
-  const dbCounts = { nodes: 0, trust: 0, attestations: 0, stores: 0 };
+  const dbCounts = { nodes: 0, trust: 0, stores: 0 };
 
   const refreshCounts = async () => {
     for (const [name, db] of Object.entries(dbs)) {
@@ -61,13 +61,11 @@ export function createHealthRouter({ helia, dbs }) {
         db_sizes: {
           nodes: dbCounts.nodes,
           trust: dbCounts.trust,
-          attestations: dbCounts.attestations,
           stores: dbCounts.stores,
         },
         db_addresses: {
           nodes: dbs.nodes.address.toString(),
           trust: dbs.trust.address.toString(),
-          attestations: dbs.attestations.address.toString(),
           stores: dbs.stores.address.toString(),
         },
         gossipsub_topics: topicPeers,
