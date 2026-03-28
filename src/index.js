@@ -660,6 +660,8 @@ async function main() {
     const { multiaddr: createMa } = await import("@multiformats/multiaddr");
 
     // Resolve any dns4 addresses and filter out self after resolution
+    // Cache resolved self-addresses so we only log once per address
+    const resolvedSelfCache = new Set();
     const resolvedSelfCheck = async (addr) => {
       const host = addr.match(/\/dns4\/([^/]+)\//)?.[1];
       if (host) {
@@ -667,7 +669,10 @@ async function main() {
           const { lookup } = await import("node:dns/promises");
           const { address: resolvedIp } = await lookup(host);
           if (ownAddresses.has(resolvedIp)) {
-            console.log(`Direct dial: Skipping self-address ${addr} (resolved to ${resolvedIp})`);
+            if (!resolvedSelfCache.has(addr)) {
+              resolvedSelfCache.add(addr);
+              console.log(`Direct dial: Skipping self-address ${addr} (resolved to ${resolvedIp})`);
+            }
             return true;
           }
         } catch {}
