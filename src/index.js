@@ -630,11 +630,55 @@ async function main() {
 
   // Direct peer dialing — for configured WeSense station addresses.
   // Handles WAN discovery where mDNS can't reach (different networks, VPS).
-  if (WESENSE_PEER_ADDRS.length > 0) {
+  // Filter out self-addresses: if ANNOUNCE_ADDRESS matches a configured peer's
+  // host, skip it — the node would be dialing itself. This is common when all
+  // nodes share the same ORBITDB_BOOTSTRAP_PEERS list that includes the bootstrap.
+  const ownAddresses = new Set();
+  if (ANNOUNCE_ADDRESS) {
+    ownAddresses.add(ANNOUNCE_ADDRESS.toLowerCase());
+    // Also resolve DNS to IP for comparison (e.g. bootstrap.wesense.earth → 74.208.250.27)
+    try {
+      const { lookup } = await import("node:dns/promises");
+      const { address: resolvedIp } = await lookup(ANNOUNCE_ADDRESS);
+      ownAddresses.add(resolvedIp);
+    } catch {
+      // Not a resolvable hostname or DNS failed — IP comparison still works
+    }
+  }
+
+  const filteredPeerAddrs = WESENSE_PEER_ADDRS.filter((addr) => {
+    const host = addr.match(/\/(?:ip4|dns4)\/([^/]+)\//)?.[1];
+    if (host && ownAddresses.has(host.toLowerCase())) {
+      console.log(`Direct dial: Skipping self-address ${addr}`);
+      return false;
+    }
+    // Also try resolving dns4 addresses to check against our IP
+    return true;
+  });
+
+  if (filteredPeerAddrs.length > 0) {
     const { multiaddr: createMa } = await import("@multiformats/multiaddr");
 
+    // Resolve any dns4 addresses and filter out self after resolution
+    const resolvedSelfCheck = async (addr) => {
+      const host = addr.match(/\/dns4\/([^/]+)\//)?.[1];
+      if (host) {
+        try {
+          const { lookup } = await import("node:dns/promises");
+          const { address: resolvedIp } = await lookup(host);
+          if (ownAddresses.has(resolvedIp)) {
+            console.log(`Direct dial: Skipping self-address ${addr} (resolved to ${resolvedIp})`);
+            return true;
+          }
+        } catch {}
+      }
+      return false;
+    };
+
     const dialConfiguredPeers = async () => {
-      for (const addr of WESENSE_PEER_ADDRS) {
+      for (const addr of filteredPeerAddrs) {
+        if (await resolvedSelfCheck(addr)) continue;
+
         const targetHost = addr.match(/\/(?:ip4|dns4)\/([^/]+)\//)?.[1];
         if (targetHost) {
           const alreadyConnected = helia.libp2p
@@ -657,7 +701,9 @@ async function main() {
 
     setTimeout(dialConfiguredPeers, 5_000);
     setInterval(dialConfiguredPeers, 60_000);
-    console.log(`Direct peer dialing enabled for: ${WESENSE_PEER_ADDRS.join(", ")}`);
+    console.log(`Direct peer dialing enabled for: ${filteredPeerAddrs.join(", ")}`);
+  } else if (WESENSE_PEER_ADDRS.length > 0) {
+    console.log("All configured bootstrap peers are self-addresses — no outbound dialing");
   }
 
   // Express HTTP API — only accessible from Docker network (port 5200),
