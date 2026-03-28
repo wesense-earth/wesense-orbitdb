@@ -297,21 +297,59 @@ async function main() {
           continue;
         }
 
-        // Check each head's block in the local FsBlockstore (no network)
+        // Check each head block AND all blocks referenced in the DAG (head + next
+        // pointers) exist in the local FsBlockstore. The previous check only verified
+        // the head block itself, which passed even when predecessor blocks were missing.
+        // During replication, OrbitDB traverses the full DAG via `next` pointers and
+        // fetches any missing blocks via bitswap — if they don't exist anywhere on the
+        // network, bitswap retries forever, leaking memory until OOM.
+        //
+        // We check: head block + all hashes in its `next` array (immediate predecessors).
+        // For deeper DAGs, we also verify the index LevelDB has entries — if heads exist
+        // but the index is empty, the DAG was never fully traversed and is incomplete.
         let orphaned = false;
-        for (const { hash } of headPointers) {
-          try {
-            const cid = CID.parse(hash, base58btc);
-            const exists = await blockstore.has(cid);
-            if (!exists) {
-              console.warn(`[${name.slice(0, 12)}] Orphaned head: ${hash.slice(0, 16)}... not in local blockstore`);
+
+        // Check 1: head blocks and their next pointers exist locally
+        for (const { hash, next } of headPointers) {
+          const hashesToCheck = [hash, ...(next || [])];
+          for (const h of hashesToCheck) {
+            try {
+              const cid = CID.parse(h, base58btc);
+              const exists = await blockstore.has(cid);
+              if (!exists) {
+                console.warn(`[${name.slice(0, 12)}] Orphaned block: ${h.slice(0, 16)}... not in local blockstore`);
+                orphaned = true;
+                break;
+              }
+            } catch (err) {
+              console.warn(`[${name.slice(0, 12)}] Error checking block ${h.slice(0, 16)}...: ${err.message}`);
               orphaned = true;
               break;
             }
-          } catch (err) {
-            console.warn(`[${name.slice(0, 12)}] Error checking head ${hash.slice(0, 16)}...: ${err.message}`);
+          }
+          if (orphaned) break;
+        }
+
+        // Check 2: if head blocks passed but the index is empty, the DAG is incomplete
+        // (heads exist but deeper entries were never loaded/stored)
+        if (!orphaned) {
+          const indexPath = `${basePath}/log/_index/`;
+          try {
+            const indexLevel = await LevelStorage({ path: indexPath });
+            let indexHasEntries = false;
+            for await (const _ of indexLevel.iterator()) {
+              indexHasEntries = true;
+              break; // just need to know if there's at least one entry
+            }
+            await indexLevel.close();
+
+            if (!indexHasEntries) {
+              console.warn(`[${name.slice(0, 12)}] Heads exist but index is empty — incomplete DAG`);
+              orphaned = true;
+            }
+          } catch {
+            // No index directory — treat as incomplete
             orphaned = true;
-            break;
           }
         }
 
