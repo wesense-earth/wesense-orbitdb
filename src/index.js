@@ -178,11 +178,9 @@ async function main() {
     if (hasBlocks) {
       let corrupt = false;
       let checked = 0;
-      const MAX_CHECK = 50; // Sample up to 50 blocks — enough to catch widespread corruption
 
       try {
         for await (const { cid, bytes: blockStream } of blockstore.getAll()) {
-          if (checked >= MAX_CHECK) break;
           try {
             const bytes = await collectBytes(blockStream);
             dagCbor.decode(bytes);
