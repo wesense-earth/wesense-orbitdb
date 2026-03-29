@@ -117,6 +117,14 @@ function parseBootstrapPeers(peersStr, defaultPort) {
 
 const WESENSE_PEER_ADDRS = parseBootstrapPeers(BOOTSTRAP_PEERS, LIBP2P_PORT);
 
+function uint8ArrayEquals(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
 async function main() {
   // Ensure data directories exist
   await mkdir(`${DATA_DIR}/blockstore`, { recursive: true });
@@ -126,23 +134,23 @@ async function main() {
   let blockstore = new FsBlockstore(`${DATA_DIR}/blockstore`);
   let datastore = new FsDatastore(`${DATA_DIR}/datastore`);
 
-  // Self-healing: scan blockstore for corrupt IPFS blocks BEFORE opening helia/OrbitDB.
+  // Self-healing: verify blockstore integrity BEFORE opening helia/OrbitDB.
   //
-  // OrbitDB stores oplog entries as dag-cbor IPFS blocks. If any blocks are
-  // corrupt (e.g. helia v6 streaming blockstore bug wrote garbage bytes, or
-  // incomplete replication left partial data), OrbitDB enters an infinite loop:
-  // peer sync tries to read/send the corrupt block → CBOR decode error → timeout
-  // → disconnect → reconnect → retry, leaking memory until OOM.
+  // Every IPFS block's CID contains a hash of its content. If the stored bytes
+  // don't match the CID's hash, the block is corrupt. The helia v6 streaming
+  // blockstore bug wrote partial/garbled bytes that may still decode as valid
+  // CBOR but whose content doesn't match the CID hash. These "silently corrupt"
+  // blocks cause OrbitDB sync to fail during replication — peers exchange entries
+  // that reference blocks whose content doesn't match, causing CBOR decode errors
+  // on the receiving side, timeouts, disconnect/reconnect cycles, and memory leaks.
   //
-  // The corruption can be anywhere in the DAG — not just in head blocks.
-  //
-  // Fix: sample blocks from the FsBlockstore and try to decode each as dag-cbor.
-  // If ANY corrupt block is found, wipe the entire OrbitDB data directory (blockstore
-  // + oplog + index). The node starts fresh and replicates clean data from peers.
+  // Fix: for each block, hash the stored bytes and compare against the CID.
+  // If ANY block fails verification, wipe all OrbitDB data (blockstore + oplog +
+  // index + datastore). The node starts fresh and replicates clean data from peers.
   // OrbitDB only holds small state data (nodes, trust, stores — ~10 entries total)
   // so rebuilding is fast and cheap.
   {
-    const dagCbor = await import("@ipld/dag-cbor");
+    const { sha256 } = await import("multiformats/hashes/sha2");
     const { rm, readdir, stat } = await import("node:fs/promises");
 
     // Collect bytes from async iterable (FsBlockstore streaming API)
@@ -151,7 +159,7 @@ async function main() {
       let total = 0;
       for await (const chunk of source) {
         total += chunk.byteLength;
-        if (total > 1024 * 1024) throw new Error("Block exceeds 1MB");
+        if (total > 2 * 1024 * 1024) throw new Error("Block exceeds 2MB");
         chunks.push(chunk);
       }
       if (chunks.length === 0) return new Uint8Array(0);
@@ -162,7 +170,7 @@ async function main() {
       return result;
     };
 
-    // Check if blockstore has any blocks at all
+    // Check if blockstore has any blocks
     const blockstorePath = `${DATA_DIR}/blockstore`;
     let hasBlocks = false;
     try {
@@ -178,18 +186,34 @@ async function main() {
     if (hasBlocks) {
       let corrupt = false;
       let checked = 0;
+      let corruptCount = 0;
 
       try {
         for await (const { cid, bytes: blockStream } of blockstore.getAll()) {
           try {
             const bytes = await collectBytes(blockStream);
-            dagCbor.decode(bytes);
-            checked++;
+
+            // Verify the content hash matches the CID's multihash.
+            // CIDs encode the hash algorithm + digest. OrbitDB uses sha2-256.
+            // If the bytes were garbled by the streaming blockstore bug, the
+            // hash won't match even if the bytes happen to be valid CBOR.
+            const hash = await sha256.digest(bytes);
+            if (!uint8ArrayEquals(hash.digest, cid.multihash.digest)) {
+              if (corruptCount === 0) {
+                console.warn(`Corrupt block: ${cid.toString().slice(0, 24)}... content hash mismatch`);
+              }
+              corruptCount++;
+              corrupt = true;
+              // Don't break — count total corrupt blocks for logging
+              if (corruptCount >= 10) break; // but stop after 10 to avoid scanning forever
+            } else {
+              checked++;
+            }
           } catch (err) {
-            const msg = err?.message || "";
-            console.warn(`Corrupt block detected: ${cid.toString().slice(0, 20)}... (${msg})`);
+            console.warn(`Block read error: ${cid.toString().slice(0, 24)}... (${err.message})`);
             corrupt = true;
-            break;
+            corruptCount++;
+            if (corruptCount >= 10) break;
           }
         }
       } catch (err) {
@@ -197,7 +221,7 @@ async function main() {
       }
 
       if (corrupt) {
-        console.warn("Blockstore contains corrupt blocks — wiping OrbitDB data to self-heal");
+        console.warn(`Found ${corruptCount} corrupt block(s) out of ${checked + corruptCount} checked — wiping OrbitDB data`);
         await blockstore.close();
         try { await rm(`${DATA_DIR}/blockstore`, { recursive: true, force: true }); } catch {}
         try { await rm(`${DATA_DIR}/orbitdb`, { recursive: true, force: true }); } catch {}
@@ -214,10 +238,9 @@ async function main() {
     }
 
     // Clean up retired attestations database directory
-    const attestationsDir = `${DATA_DIR}/orbitdb/orbitdb/zdpuAyzsJLK74DoVEQNzW9yyyL3Zfr8AEPc1dJZz2Kd8rvHX2`;
     try {
-      const { rm: rm2 } = await import("node:fs/promises");
-      await rm2(attestationsDir, { recursive: true, force: true });
+      const attestationsDir = `${DATA_DIR}/orbitdb/orbitdb/zdpuAyzsJLK74DoVEQNzW9yyyL3Zfr8AEPc1dJZz2Kd8rvHX2`;
+      await rm(attestationsDir, { recursive: true, force: true });
       console.log("Cleaned up retired attestations database directory");
     } catch {}
   }
