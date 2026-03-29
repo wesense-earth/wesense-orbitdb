@@ -268,6 +268,25 @@ async function main() {
     const { base58btc } = await import("multiformats/bases/base58");
     const { LevelStorage } = await import("@orbitdb/core");
     const { readdir } = await import("node:fs/promises");
+    const dagCbor = await import("@ipld/dag-cbor");
+
+    // FsBlockstore.get() returns an async iterable (helia v6 streaming).
+    // Collect into a single Uint8Array for dag-cbor decode.
+    const collectBlockBytes = async (source) => {
+      const chunks = [];
+      let total = 0;
+      for await (const chunk of source) {
+        total += chunk.byteLength;
+        if (total > 1024 * 1024) throw new Error("Block exceeds 1MB — refusing to decode");
+        chunks.push(chunk);
+      }
+      if (chunks.length === 0) return new Uint8Array(0);
+      if (chunks.length === 1) return chunks[0];
+      const result = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) { result.set(chunk, offset); offset += chunk.byteLength; }
+      return result;
+    };
 
     // Find all database directories that have a log/_heads/ subdirectory
     const orbitdbDir = `${DATA_DIR}/orbitdb/orbitdb`;
@@ -297,19 +316,18 @@ async function main() {
           continue;
         }
 
-        // Check each head block AND all blocks referenced in the DAG (head + next
-        // pointers) exist in the local FsBlockstore. The previous check only verified
-        // the head block itself, which passed even when predecessor blocks were missing.
-        // During replication, OrbitDB traverses the full DAG via `next` pointers and
-        // fetches any missing blocks via bitswap — if they don't exist anywhere on the
-        // network, bitswap retries forever, leaking memory until OOM.
-        //
-        // We check: head block + all hashes in its `next` array (immediate predecessors).
-        // For deeper DAGs, we also verify the index LevelDB has entries — if heads exist
-        // but the index is empty, the DAG was never fully traversed and is incomplete.
+        // Full integrity check: verify head blocks and their next pointers
+        // exist locally AND are valid dag-cbor. Three failure modes:
+        //   1. Block missing from blockstore (wiped/disk failure)
+        //   2. Block exists but contents are corrupt (helia v6 streaming
+        //      blockstore bug wrote garbage bytes — CBOR decode fails)
+        //   3. Heads exist but index is empty (incomplete DAG traversal)
+        // Any of these causes OrbitDB to enter an infinite retry loop
+        // during replication, leaking memory until OOM.
         let orphaned = false;
+        let reason = "";
 
-        // Check 1: head blocks and their next pointers exist locally
+        // Check 1: head blocks and next pointers exist AND decode as valid CBOR
         for (const { hash, next } of headPointers) {
           const hashesToCheck = [hash, ...(next || [])];
           for (const h of hashesToCheck) {
@@ -317,12 +335,20 @@ async function main() {
               const cid = CID.parse(h, base58btc);
               const exists = await blockstore.has(cid);
               if (!exists) {
-                console.warn(`[${name.slice(0, 12)}] Orphaned block: ${h.slice(0, 16)}... not in local blockstore`);
+                reason = `missing block ${h.slice(0, 16)}...`;
                 orphaned = true;
                 break;
               }
+              // Read the block and verify it decodes as valid dag-cbor
+              const bytes = await collectBlockBytes(blockstore.get(cid));
+              dagCbor.decode(bytes);
             } catch (err) {
-              console.warn(`[${name.slice(0, 12)}] Error checking block ${h.slice(0, 16)}...: ${err.message}`);
+              const msg = err?.message || "";
+              if (msg.includes("CBOR") || msg.includes("terminal") || msg.includes("decode")) {
+                reason = `corrupt block ${h.slice(0, 16)}... (${msg})`;
+              } else {
+                reason = `block check failed ${h.slice(0, 16)}... (${msg})`;
+              }
               orphaned = true;
               break;
             }
@@ -330,8 +356,7 @@ async function main() {
           if (orphaned) break;
         }
 
-        // Check 2: if head blocks passed but the index is empty, the DAG is incomplete
-        // (heads exist but deeper entries were never loaded/stored)
+        // Check 2: if blocks passed but the index is empty, the DAG is incomplete
         if (!orphaned) {
           const indexPath = `${basePath}/log/_index/`;
           try {
@@ -339,16 +364,16 @@ async function main() {
             let indexHasEntries = false;
             for await (const _ of indexLevel.iterator()) {
               indexHasEntries = true;
-              break; // just need to know if there's at least one entry
+              break;
             }
             await indexLevel.close();
 
             if (!indexHasEntries) {
-              console.warn(`[${name.slice(0, 12)}] Heads exist but index is empty — incomplete DAG`);
+              reason = "heads exist but index is empty — incomplete DAG";
               orphaned = true;
             }
           } catch {
-            // No index directory — treat as incomplete
+            reason = "index directory missing — incomplete DAG";
             orphaned = true;
           }
         }
@@ -356,7 +381,8 @@ async function main() {
         if (orphaned) {
           // Clear the heads — removes the pointers so OrbitDB starts with no heads
           await headsLevel.del("heads");
-          console.log(`[${name.slice(0, 12)}] Cleared orphaned heads — will replicate fresh from peers`);
+          console.warn(`[${name.slice(0, 12)}] ${reason}`);
+          console.log(`[${name.slice(0, 12)}] Cleared damaged oplog — will replicate fresh from peers`);
 
           // Also clear the index LevelDB so it stays consistent with empty heads
           const indexPath = `${basePath}/log/_index/`;
