@@ -220,8 +220,23 @@ async function main() {
         console.warn(`Blockstore scan error: ${err.message} — skipping integrity check`);
       }
 
-      if (corrupt) {
-        console.warn(`Found ${corruptCount} corrupt block(s) out of ${checked + corruptCount} checked — wiping OrbitDB data`);
+      const totalBlocks = checked + corruptCount;
+
+      // Wipe if corrupt blocks found OR if blockstore has excessive stale blocks.
+      // OrbitDB with 3 small databases (nodes, trust, stores) should have <500 blocks.
+      // Thousands of blocks indicate stale data from removed databases (e.g. attestations)
+      // which overwhelms the sync protocol and triggers the helia streaming blockstore bug.
+      const MAX_EXPECTED_BLOCKS = 500;
+      const shouldWipe = corrupt || totalBlocks > MAX_EXPECTED_BLOCKS;
+
+      if (shouldWipe) {
+        if (corrupt) {
+          console.warn(`Found ${corruptCount} corrupt block(s) out of ${totalBlocks} checked`);
+        }
+        if (totalBlocks > MAX_EXPECTED_BLOCKS) {
+          console.warn(`Blockstore has ${totalBlocks} blocks (expected <${MAX_EXPECTED_BLOCKS}) — stale data from removed databases`);
+        }
+        console.warn("Wiping OrbitDB data to self-heal");
         await blockstore.close();
         try { await rm(`${DATA_DIR}/blockstore`, { recursive: true, force: true }); } catch {}
         try { await rm(`${DATA_DIR}/orbitdb`, { recursive: true, force: true }); } catch {}
