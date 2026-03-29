@@ -123,8 +123,106 @@ async function main() {
   await mkdir(`${DATA_DIR}/datastore`, { recursive: true });
   await mkdir(`${DATA_DIR}/orbitdb`, { recursive: true });
 
-  const blockstore = new FsBlockstore(`${DATA_DIR}/blockstore`);
-  const datastore = new FsDatastore(`${DATA_DIR}/datastore`);
+  let blockstore = new FsBlockstore(`${DATA_DIR}/blockstore`);
+  let datastore = new FsDatastore(`${DATA_DIR}/datastore`);
+
+  // Self-healing: scan blockstore for corrupt IPFS blocks BEFORE opening helia/OrbitDB.
+  //
+  // OrbitDB stores oplog entries as dag-cbor IPFS blocks. If any blocks are
+  // corrupt (e.g. helia v6 streaming blockstore bug wrote garbage bytes, or
+  // incomplete replication left partial data), OrbitDB enters an infinite loop:
+  // peer sync tries to read/send the corrupt block → CBOR decode error → timeout
+  // → disconnect → reconnect → retry, leaking memory until OOM.
+  //
+  // The corruption can be anywhere in the DAG — not just in head blocks.
+  //
+  // Fix: sample blocks from the FsBlockstore and try to decode each as dag-cbor.
+  // If ANY corrupt block is found, wipe the entire OrbitDB data directory (blockstore
+  // + oplog + index). The node starts fresh and replicates clean data from peers.
+  // OrbitDB only holds small state data (nodes, trust, stores — ~10 entries total)
+  // so rebuilding is fast and cheap.
+  {
+    const dagCbor = await import("@ipld/dag-cbor");
+    const { rm, readdir, stat } = await import("node:fs/promises");
+
+    // Collect bytes from async iterable (FsBlockstore streaming API)
+    const collectBytes = async (source) => {
+      const chunks = [];
+      let total = 0;
+      for await (const chunk of source) {
+        total += chunk.byteLength;
+        if (total > 1024 * 1024) throw new Error("Block exceeds 1MB");
+        chunks.push(chunk);
+      }
+      if (chunks.length === 0) return new Uint8Array(0);
+      if (chunks.length === 1) return chunks[0];
+      const result = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) { result.set(chunk, offset); offset += chunk.byteLength; }
+      return result;
+    };
+
+    // Check if blockstore has any blocks at all
+    const blockstorePath = `${DATA_DIR}/blockstore`;
+    let hasBlocks = false;
+    try {
+      const shards = await readdir(blockstorePath);
+      for (const shard of shards) {
+        const st = await stat(`${blockstorePath}/${shard}`);
+        if (st.isDirectory()) { hasBlocks = true; break; }
+      }
+    } catch {
+      // No blockstore yet — first start
+    }
+
+    if (hasBlocks) {
+      let corrupt = false;
+      let checked = 0;
+      const MAX_CHECK = 50; // Sample up to 50 blocks — enough to catch widespread corruption
+
+      try {
+        for await (const { cid, bytes: blockStream } of blockstore.getAll()) {
+          if (checked >= MAX_CHECK) break;
+          try {
+            const bytes = await collectBytes(blockStream);
+            dagCbor.decode(bytes);
+            checked++;
+          } catch (err) {
+            const msg = err?.message || "";
+            console.warn(`Corrupt block detected: ${cid.toString().slice(0, 20)}... (${msg})`);
+            corrupt = true;
+            break;
+          }
+        }
+      } catch (err) {
+        console.warn(`Blockstore scan error: ${err.message} — skipping integrity check`);
+      }
+
+      if (corrupt) {
+        console.warn("Blockstore contains corrupt blocks — wiping OrbitDB data to self-heal");
+        await blockstore.close();
+        try { await rm(`${DATA_DIR}/blockstore`, { recursive: true, force: true }); } catch {}
+        try { await rm(`${DATA_DIR}/orbitdb`, { recursive: true, force: true }); } catch {}
+        try { await rm(`${DATA_DIR}/datastore`, { recursive: true, force: true }); } catch {}
+        await mkdir(`${DATA_DIR}/blockstore`, { recursive: true });
+        await mkdir(`${DATA_DIR}/datastore`, { recursive: true });
+        await mkdir(`${DATA_DIR}/orbitdb`, { recursive: true });
+        blockstore = new FsBlockstore(`${DATA_DIR}/blockstore`);
+        datastore = new FsDatastore(`${DATA_DIR}/datastore`);
+        console.log("OrbitDB data wiped — will replicate fresh from peers on connect");
+      } else if (checked > 0) {
+        console.log(`Blockstore integrity OK (${checked} blocks verified)`);
+      }
+    }
+
+    // Clean up retired attestations database directory
+    const attestationsDir = `${DATA_DIR}/orbitdb/orbitdb/zdpuAyzsJLK74DoVEQNzW9yyyL3Zfr8AEPc1dJZz2Kd8rvHX2`;
+    try {
+      const { rm: rm2 } = await import("node:fs/promises");
+      await rm2(attestationsDir, { recursive: true, force: true });
+      console.log("Cleaned up retired attestations database directory");
+    } catch {}
+  }
 
   // Announce the host's real IP/hostname so peers on other networks can reach us
   const announceProto = ANNOUNCE_ADDRESS && /^[\d.]+$/.test(ANNOUNCE_ADDRESS) ? "ip4" : "dns4";
@@ -252,171 +350,6 @@ async function main() {
   // Wrap helia so OrbitDB gets the non-streaming API it needs.
   // See: https://github.com/orbitdb/orbitdb/issues/1244
   const heliaForOrbitDB = wrapHeliaForOrbitDB(helia);
-
-  // Self-healing: detect and clear orphaned oplog heads BEFORE opening databases.
-  // If the blockstore was wiped (e.g. migration, disk failure) but oplog head
-  // pointers in LevelDB survived, OrbitDB enters an infinite loop: every peer
-  // sync tries to fetch the missing blocks via bitswap, times out after 30s,
-  // disconnects, reconnects, and retries — leaking memory until OOM.
-  // Fix: scan for all heads LevelDBs, check each block exists in the LOCAL
-  // FsBlockstore (no bitswap/network). If missing, clear the heads and index
-  // so the database starts fresh and replicates cleanly from peers.
-  // Must run BEFORE openDatabases() — once OrbitDB opens the LevelDB, it holds
-  // an exclusive lock and we can't open a second reader.
-  {
-    const { CID } = await import("multiformats/cid");
-    const { base58btc } = await import("multiformats/bases/base58");
-    const { LevelStorage } = await import("@orbitdb/core");
-    const { readdir } = await import("node:fs/promises");
-    const dagCbor = await import("@ipld/dag-cbor");
-
-    // FsBlockstore.get() returns an async iterable (helia v6 streaming).
-    // Collect into a single Uint8Array for dag-cbor decode.
-    const collectBlockBytes = async (source) => {
-      const chunks = [];
-      let total = 0;
-      for await (const chunk of source) {
-        total += chunk.byteLength;
-        if (total > 1024 * 1024) throw new Error("Block exceeds 1MB — refusing to decode");
-        chunks.push(chunk);
-      }
-      if (chunks.length === 0) return new Uint8Array(0);
-      if (chunks.length === 1) return chunks[0];
-      const result = new Uint8Array(total);
-      let offset = 0;
-      for (const chunk of chunks) { result.set(chunk, offset); offset += chunk.byteLength; }
-      return result;
-    };
-
-    // Find all database directories that have a log/_heads/ subdirectory
-    const orbitdbDir = `${DATA_DIR}/orbitdb/orbitdb`;
-    let dbDirs = [];
-    try {
-      const entries = await readdir(orbitdbDir);
-      dbDirs = entries.map((e) => ({ name: e, basePath: `${orbitdbDir}/${e}` }));
-    } catch {
-      // No orbitdb directory yet — first start, nothing to check
-    }
-
-    for (const { name, basePath } of dbDirs) {
-      const headsPath = `${basePath}/log/_heads/`;
-      try {
-        const headsLevel = await LevelStorage({ path: headsPath });
-        const decoder = new TextDecoder();
-        const rawBytes = await headsLevel.get("heads");
-
-        if (!rawBytes) {
-          await headsLevel.close();
-          continue;
-        }
-
-        const headPointers = JSON.parse(decoder.decode(rawBytes));
-        if (headPointers.length === 0) {
-          await headsLevel.close();
-          continue;
-        }
-
-        // Full integrity check: verify head blocks and their next pointers
-        // exist locally AND are valid dag-cbor. Three failure modes:
-        //   1. Block missing from blockstore (wiped/disk failure)
-        //   2. Block exists but contents are corrupt (helia v6 streaming
-        //      blockstore bug wrote garbage bytes — CBOR decode fails)
-        //   3. Heads exist but index is empty (incomplete DAG traversal)
-        // Any of these causes OrbitDB to enter an infinite retry loop
-        // during replication, leaking memory until OOM.
-        let orphaned = false;
-        let reason = "";
-
-        // Check 1: head blocks and next pointers exist AND decode as valid CBOR
-        for (const { hash, next } of headPointers) {
-          const hashesToCheck = [hash, ...(next || [])];
-          for (const h of hashesToCheck) {
-            try {
-              const cid = CID.parse(h, base58btc);
-              const exists = await blockstore.has(cid);
-              if (!exists) {
-                reason = `missing block ${h.slice(0, 16)}...`;
-                orphaned = true;
-                break;
-              }
-              // Read the block and verify it decodes as valid dag-cbor
-              const bytes = await collectBlockBytes(blockstore.get(cid));
-              dagCbor.decode(bytes);
-            } catch (err) {
-              const msg = err?.message || "";
-              if (msg.includes("CBOR") || msg.includes("terminal") || msg.includes("decode")) {
-                reason = `corrupt block ${h.slice(0, 16)}... (${msg})`;
-              } else {
-                reason = `block check failed ${h.slice(0, 16)}... (${msg})`;
-              }
-              orphaned = true;
-              break;
-            }
-          }
-          if (orphaned) break;
-        }
-
-        // Check 2: if blocks passed but the index is empty, the DAG is incomplete
-        if (!orphaned) {
-          const indexPath = `${basePath}/log/_index/`;
-          try {
-            const indexLevel = await LevelStorage({ path: indexPath });
-            let indexHasEntries = false;
-            for await (const _ of indexLevel.iterator()) {
-              indexHasEntries = true;
-              break;
-            }
-            await indexLevel.close();
-
-            if (!indexHasEntries) {
-              reason = "heads exist but index is empty — incomplete DAG";
-              orphaned = true;
-            }
-          } catch {
-            reason = "index directory missing — incomplete DAG";
-            orphaned = true;
-          }
-        }
-
-        if (orphaned) {
-          // Clear the heads — removes the pointers so OrbitDB starts with no heads
-          await headsLevel.del("heads");
-          console.warn(`[${name.slice(0, 12)}] ${reason}`);
-          console.log(`[${name.slice(0, 12)}] Cleared damaged oplog — will replicate fresh from peers`);
-
-          // Also clear the index LevelDB so it stays consistent with empty heads
-          const indexPath = `${basePath}/log/_index/`;
-          try {
-            const indexLevel = await LevelStorage({ path: indexPath });
-            await indexLevel.clear();
-            await indexLevel.close();
-          } catch {}
-        } else {
-          console.log(`[${name.slice(0, 12)}] Head integrity OK (${headPointers.length} heads)`);
-        }
-
-        await headsLevel.close();
-      } catch (err) {
-        if (!err.message?.includes("ENOENT")) {
-          console.warn(`[${name.slice(0, 12)}] Head integrity check error: ${err.message}`);
-        }
-      }
-    }
-  }
-
-  // Clean up retired attestations database directory if it still exists on disk.
-  // wesense.attestations was removed from OrbitDB (moved to iroh sidecar path
-  // index exchange) but its LevelDB data may persist from previous deployments.
-  {
-    const { rm } = await import("node:fs/promises");
-    const attestationsDir = `${DATA_DIR}/orbitdb/orbitdb/zdpuAyzsJLK74DoVEQNzW9yyyL3Zfr8AEPc1dJZz2Kd8rvHX2`;
-    try {
-      await rm(attestationsDir, { recursive: true, force: true });
-      console.log("Cleaned up retired attestations database directory");
-    } catch {
-      // Directory doesn't exist or already cleaned — fine
-    }
-  }
 
   const orbitdb = await createOrbitDB({
     ipfs: heliaForOrbitDB,
