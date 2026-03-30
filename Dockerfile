@@ -2,6 +2,9 @@ FROM node:22-slim
 WORKDIR /app
 COPY package*.json ./
 RUN npm install --omit=dev
+# Bust cache for application code on every CI build
+ARG CACHE_BUST=1
+
 COPY src/ ./src/
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
