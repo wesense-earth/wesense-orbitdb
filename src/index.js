@@ -50,6 +50,7 @@ import { createHealthRouter } from "./routes/health.js";
 const KNOWN_SYNC_ERRORS = [
   "CBOR decode error",
   "Failed to load block",
+  "LoadBlockFailedError",
   "Want was aborted",
   "stream has been reset",
   "Unexpected EOF",
@@ -250,13 +251,13 @@ async function main() {
       } else if (checked > 0) {
         console.log(`Blockstore integrity OK (${checked} blocks verified)`);
       }
+
     }
 
     // Clean up retired attestations database directory
     try {
       const attestationsDir = `${DATA_DIR}/orbitdb/orbitdb/zdpuAyzsJLK74DoVEQNzW9yyyL3Zfr8AEPc1dJZz2Kd8rvHX2`;
       await rm(attestationsDir, { recursive: true, force: true });
-      console.log("Cleaned up retired attestations database directory");
     } catch {}
   }
 
@@ -392,8 +393,56 @@ async function main() {
     directory: `${DATA_DIR}/orbitdb`,
   });
 
-  const dbs = await openDatabases(orbitdb);
+  let dbs = await openDatabases(orbitdb);
   console.log(`Databases opened — nodes: ${dbs.nodes.address}, trust: ${dbs.trust.address}`);
+
+  // Self-healing: verify all oplog heads reference blocks that exist locally.
+  // If a head references a block that doesn't exist (orphaned from a previous
+  // blockstore wipe, incomplete sync, or corrupt peer data), OrbitDB will
+  // fire LoadBlockFailedError on every sync cycle — spamming logs and wasting
+  // resources indefinitely.
+  //
+  // Strategy: try loading each database's heads. At startup (before peers
+  // connect), bitswap has no peers to query so missing blocks fail immediately
+  // rather than waiting for a timeout. If any heads fail to load, drop that
+  // database and re-open it — it will replicate fresh from peers on connect.
+  // OrbitDB holds ~10 entries across 3 small databases so rebuild is fast.
+  {
+    const dbsToReset = [];
+
+    for (const [name, db] of Object.entries(dbs)) {
+      try {
+        // heads() loads each head entry from IPFS blocks via the oplog store.
+        // If a block is missing locally and no peers are connected, this throws
+        // LoadBlockFailedError almost immediately (bitswap has no one to ask).
+        const heads = await Promise.race([
+          db.log.heads(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 5000)),
+        ]);
+        if (heads) {
+          console.log(`[${name}] Oplog heads OK (${heads.length} heads)`);
+        }
+      } catch (err) {
+        console.warn(`[${name}] Orphaned oplog heads detected: ${err.message}`);
+        dbsToReset.push(name);
+      }
+    }
+
+    if (dbsToReset.length > 0) {
+      console.warn(`Dropping ${dbsToReset.length} database(s) with orphaned heads: ${dbsToReset.join(", ")}`);
+      for (const name of dbsToReset) {
+        try {
+          await dbs[name].drop();
+          console.log(`[${name}] Dropped — will replicate fresh from peers`);
+        } catch (err) {
+          console.warn(`[${name}] Drop failed: ${err.message}`);
+        }
+      }
+      // Re-open dropped databases
+      dbs = await openDatabases(orbitdb);
+      console.log("Databases re-opened after self-heal");
+    }
+  }
 
   // Patch access controllers to tolerate missing identity blocks.
   // Old oplog entries created before the helia-compat.js fix have identity
@@ -515,10 +564,6 @@ async function main() {
       console.log(`[${name}] Peer joined DB: ${peerId} (${heads?.length || 0} heads)`);
     });
     db.events.on("error", (err) => {
-      // Log but don't crash — sync will retry on the next peer connection
-      // or periodic trigger. Common errors:
-      //   - LoadBlockFailedError: block not available on any connected peer
-      //   - CBOR decode error: corrupt or incompatible oplog entry from peer
       console.warn(`[${name}] Sync error (non-fatal): ${err.message}`);
     });
   }
