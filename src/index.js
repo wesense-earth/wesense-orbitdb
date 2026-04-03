@@ -227,16 +227,8 @@ async function main() {
       // OrbitDB with 3 small databases (nodes, trust, stores) should have <500 blocks.
       // Thousands of blocks indicate stale data from removed databases (e.g. attestations)
       // which overwhelms the sync protocol and triggers the helia streaming blockstore bug.
-      const MAX_EXPECTED_BLOCKS = 500;
-      const shouldWipe = corrupt || totalBlocks > MAX_EXPECTED_BLOCKS;
-
-      if (shouldWipe) {
-        if (corrupt) {
-          console.warn(`Found ${corruptCount} corrupt block(s) out of ${totalBlocks} checked`);
-        }
-        if (totalBlocks > MAX_EXPECTED_BLOCKS) {
-          console.warn(`Blockstore has ${totalBlocks} blocks (expected <${MAX_EXPECTED_BLOCKS}) — stale data from removed databases`);
-        }
+      if (corrupt) {
+        console.warn(`Found ${corruptCount} corrupt block(s) out of ${totalBlocks} checked`);
         console.warn("Wiping OrbitDB data to self-heal");
         await blockstore.close();
         try { await rm(`${DATA_DIR}/blockstore`, { recursive: true, force: true }); } catch {}
