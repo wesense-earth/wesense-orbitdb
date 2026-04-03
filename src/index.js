@@ -30,6 +30,8 @@ import { FsDatastore } from "datastore-fs";
 import { createOrbitDB } from "@orbitdb/core";
 import express from "express";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
+import { createServer as createHttpsServer } from "node:https";
 
 import { openDatabases } from "./databases.js";
 import { wrapHeliaForOrbitDB } from "./helia-compat.js";
@@ -757,9 +759,23 @@ async function main() {
   // have fully released the port yet during a restart.
   let httpServer = null;
   const startServer = (retries = 5, delay = 2000) => {
-    const server = app.listen(PORT, () => {
-      console.log(`HTTP API listening on port ${PORT}`);
-    });
+    let server;
+    const TLS_ON = process.env.TLS_ENABLED === "true";
+    const certFile = process.env.TLS_CERTFILE || "/app/certs/fullchain.pem";
+    const keyFile = process.env.TLS_KEYFILE || "/app/certs/privkey.pem";
+
+    if (TLS_ON && existsSync(certFile) && existsSync(keyFile)) {
+      server = createHttpsServer({
+        cert: readFileSync(certFile),
+        key: readFileSync(keyFile),
+      }, app).listen(PORT, () => {
+        console.log(`HTTPS API listening on port ${PORT}`);
+      });
+    } else {
+      server = app.listen(PORT, () => {
+        console.log(`HTTP API listening on port ${PORT}`);
+      });
+    }
     server.on("error", (err) => {
       if (err.code === "EADDRINUSE" && retries > 0) {
         console.warn(`Port ${PORT} in use, retrying in ${delay / 1000}s (${retries} left)...`);
