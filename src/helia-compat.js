@@ -42,8 +42,27 @@ async function collectBytes(source) {
 }
 
 /**
+ * Failed-CID cache: tracks CIDs whose block fetch failed.
+ * Prevents OrbitDB from retrying the same unreachable block on every
+ * sync cycle, which spams logs and wastes resources.
+ *
+ * After FAIL_COOLDOWN_MS, the CID is eligible for retry in case a peer
+ * that has the block comes online.
+ */
+const FAIL_COOLDOWN_MS = 15 * 60 * 1000; // 15 minutes before retrying a failed CID
+const MAX_FAIL_CACHE_SIZE = 10000;
+const failedCids = new Map(); // CID string → { failedAt, attempts }
+
+function cidToString(cid) {
+  return typeof cid === "string" ? cid : cid.toString();
+}
+
+/**
  * Wrap a Helia instance so its blockstore.get() returns a plain
  * Uint8Array (via Promise) instead of an AsyncGenerator.
+ *
+ * Also caches failed CID lookups to prevent repeated fetches of
+ * unreachable blocks (orphaned oplog entries, corrupted identity blocks).
  *
  * All other properties and methods are forwarded unchanged.
  *
@@ -52,11 +71,43 @@ async function collectBytes(source) {
  */
 export function wrapHeliaForOrbitDB(helia) {
   const origGet = helia.blockstore.get.bind(helia.blockstore);
+  const origHas = helia.blockstore.has.bind(helia.blockstore);
 
   const blockstoreProxy = new Proxy(helia.blockstore, {
     get(target, prop) {
       if (prop === "get") {
-        return async (cid, options) => collectBytes(origGet(cid, options));
+        return async (cid, options) => {
+          const key = cidToString(cid);
+          const cached = failedCids.get(key);
+          if (cached) {
+            const elapsed = Date.now() - cached.failedAt;
+            if (elapsed < FAIL_COOLDOWN_MS) {
+              throw new Error(`Block ${key.slice(0, 20)}... unreachable (attempt ${cached.attempts}, retry in ${Math.ceil((FAIL_COOLDOWN_MS - elapsed) / 60000)}m)`);
+            }
+            // Cooldown expired — allow retry
+            failedCids.delete(key);
+          }
+
+          try {
+            return await collectBytes(origGet(cid, options));
+          } catch (err) {
+            // Record failure
+            const prev = failedCids.get(key);
+            const attempts = (prev?.attempts || 0) + 1;
+            failedCids.set(key, { failedAt: Date.now(), attempts });
+
+            // Evict oldest entries if cache is full
+            if (failedCids.size > MAX_FAIL_CACHE_SIZE) {
+              const oldest = failedCids.keys().next().value;
+              failedCids.delete(oldest);
+            }
+
+            if (attempts === 1) {
+              console.warn(`Block ${key.slice(0, 20)}... fetch failed, will not retry for ${FAIL_COOLDOWN_MS / 60000}m: ${err.message}`);
+            }
+            throw err;
+          }
+        };
       }
       const val = target[prop];
       return typeof val === "function" ? val.bind(target) : val;
