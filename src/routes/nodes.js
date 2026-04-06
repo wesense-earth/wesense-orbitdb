@@ -16,9 +16,11 @@ import { Router } from "express";
 const NODE_ALLOWED_FIELDS = new Set([
   "ingester_id", "node_name", "regions", "version", "uptime",
   "zenoh_endpoint", "zenoh_endpoint_lan", "zenoh_proxy",
-  "iroh_node_id", "iroh_endpoint", "iroh_address", "iroh_quic_port", "iroh_sidecar_port",
+  "iroh_node_id", "iroh_endpoint", "iroh_address", "iroh_quic_port",
+  "archive_replicator_port", "iroh_sidecar_port",  // iroh_sidecar_port kept for backward compat
   "iroh_relay_urls", "announce_address",
-  "store_scope", "capabilities", "source", "type", "public_key", "key_version",
+  "guardian_scope", "store_scope",  // store_scope kept for backward compat
+  "capabilities", "source", "type", "public_key", "key_version",
 ]);
 const MAX_ID_LENGTH = 256;
 const MAX_FIELD_VALUE_LENGTH = 4096;

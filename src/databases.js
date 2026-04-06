@@ -16,7 +16,7 @@
  * Note: wesense.attestations was removed — attestations grew unbounded
  * (4,888+ entries), causing OrbitDB sync timeouts and memory leaks.
  * Archive discovery now uses peer-to-peer path index exchange via the
- * iroh sidecar. See IrohPlan.md Phase 3.
+ * archive replicator. See IrohPlan.md Phase 3.
  */
 
 import { IPFSAccessController } from "@orbitdb/core";
