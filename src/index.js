@@ -688,6 +688,35 @@ async function main() {
     setInterval(checkDiskSpace, 5 * 60_000);
   }
 
+  // Oplog compaction — periodically remove expired entries from storage.
+  // TTL filtering happens at read time, but compact() reclaims disk space
+  // by deleting entries that have passed their TTL from the blockstore.
+  {
+    const compactAll = async () => {
+      let total = 0;
+      for (const [name, db] of Object.entries(dbs)) {
+        try {
+          if (db.log && typeof db.log.compact === 'function') {
+            const removed = await db.log.compact();
+            if (removed > 0) {
+              console.log(`[${name}] Compacted: ${removed} expired oplog entries removed`);
+            }
+            total += removed;
+          }
+        } catch (err) {
+          console.warn(`[${name}] Compact failed: ${err.message}`);
+        }
+      }
+      if (total > 0) {
+        console.log(`Oplog compaction complete: ${total} total entries removed`);
+      }
+    };
+
+    // Compact once on startup (after 2 minutes to let sync settle), then daily
+    setTimeout(compactAll, 2 * 60_000);
+    setInterval(compactAll, 24 * 60 * 60_000);
+  }
+
   // Node registry cleanup — remove entries not updated within NODE_TTL_DAYS.
   const cleanupStaleNodes = async () => {
     try {

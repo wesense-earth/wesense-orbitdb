@@ -28,9 +28,17 @@ import { IPFSAccessController } from "@orbitdb/core";
  * @returns {Promise<{nodes: object, trust: object, stores: object}>}
  */
 export async function openDatabases(orbitdb) {
+  // TTL: 30 days — oplog entries older than this are filtered during reads
+  // and not sent to peers during sync. This prevents orphaned entries from
+  // accumulating indefinitely. These databases hold current state (node
+  // registry, trust list, store scopes) where only recent entries matter.
+  // Call db.log.compact() periodically to reclaim storage from expired entries.
+  const TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
   const opts = {
     type: "documents",
     AccessController: IPFSAccessController({ write: ["*"] }),
+    ttl: TTL_MS,
   };
 
   const nodes = await orbitdb.open("wesense.nodes", opts);
