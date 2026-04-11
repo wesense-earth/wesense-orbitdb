@@ -34,7 +34,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { createServer as createHttpsServer } from "node:https";
 
 import { openDatabases } from "./databases.js";
-import { wrapHeliaForOrbitDB, setDiskFull } from "./helia-compat.js";
+import { wrapHeliaForOrbitDB, setDiskFull, getBlacklistStats } from "./helia-compat.js";
 import { createNodesRouter } from "./routes/nodes.js";
 import { createTrustRouter } from "./routes/trust.js";
 import { createStoresRouter } from "./routes/stores.js";
@@ -805,6 +805,12 @@ async function main() {
   app.use("/trust", createTrustRouter(dbs.trust));
   app.use("/stores", createStoresRouter(dbs.stores));
   app.use("/health", createHealthRouter({ helia, dbs }));
+
+  // Block blacklist status (read-only)
+  app.get("/blacklist", (req, res) => {
+    const stats = getBlacklistStats();
+    res.json(stats);
+  });
 
   // Retry listen — with network_mode: host the previous container may not
   // have fully released the port yet during a restart.

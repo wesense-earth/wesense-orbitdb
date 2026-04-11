@@ -127,6 +127,35 @@ export function setDiskFull(full) {
 }
 
 /**
+ * Get blacklist stats for the /status HTTP endpoint.
+ * @returns {{ blacklisted: number, pendingFailures: number }}
+ */
+export function getBlacklistStats() {
+  return {
+    blacklisted: permanentBlacklist.size,
+    pendingFailures: failedCids.size,
+  };
+}
+
+/**
+ * Manually blacklist a CID immediately (e.g. from an admin API).
+ * @param {string} cidStr The CID string to blacklist
+ */
+export function manuallyBlacklist(cidStr) {
+  if (permanentBlacklist.has(cidStr)) return false;
+  permanentBlacklist.set(cidStr, {
+    blacklistedAt: new Date().toISOString(),
+    attempts: 0,
+    manual: true,
+  });
+  failedCids.delete(cidStr);
+  blacklistDirty = true;
+  saveBlacklist();
+  console.warn(`Block ${cidStr.slice(0, 20)}... manually blacklisted`);
+  return true;
+}
+
+/**
  * Wrap a Helia instance so its blockstore.get() returns a plain
  * Uint8Array (via Promise) instead of an AsyncGenerator.
  *
