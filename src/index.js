@@ -34,7 +34,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { createServer as createHttpsServer } from "node:https";
 
 import { openDatabases } from "./databases.js";
-import { wrapHeliaForOrbitDB } from "./helia-compat.js";
+import { wrapHeliaForOrbitDB, setDiskFull } from "./helia-compat.js";
 import { createNodesRouter } from "./routes/nodes.js";
 import { createTrustRouter } from "./routes/trust.js";
 import { createStoresRouter } from "./routes/stores.js";
@@ -636,6 +636,57 @@ async function main() {
   };
   setInterval(logResourceStats, 60_000);
   setTimeout(logResourceStats, 10_000); // first report shortly after startup
+
+  // Disk space monitoring — prevent orphaned block references from disk-full
+  // partial writes. Checks the filesystem containing DATA_DIR every 5 minutes.
+  // At 90% capacity: warn. At 95%: block writes. Below 90%: resume writes.
+  {
+    const { execSync } = await import("node:child_process");
+    let diskWritesBlocked = false;
+
+    const checkDiskSpace = () => {
+      try {
+        // Use df to get usage percentage for the filesystem containing DATA_DIR.
+        // -P forces POSIX output (single line per filesystem, consistent columns).
+        const output = execSync(`df -P "${DATA_DIR}"`, { encoding: "utf-8", timeout: 5000 });
+        const lines = output.trim().split("\n");
+        if (lines.length < 2) return;
+        // POSIX df columns: Filesystem 1024-blocks Used Available Capacity Mounted-on
+        const fields = lines[1].split(/\s+/);
+        const capacityStr = fields[4]; // e.g. "92%"
+        if (!capacityStr) return;
+        const usagePercent = parseInt(capacityStr.replace("%", ""), 10);
+        if (isNaN(usagePercent)) return;
+
+        if (usagePercent >= 95) {
+          if (!diskWritesBlocked) {
+            console.error(`DISK SPACE CRITICAL: ${usagePercent}% used on ${DATA_DIR} — blocking blockstore writes`);
+            setDiskFull(true);
+            diskWritesBlocked = true;
+          }
+        } else if (usagePercent >= 90) {
+          console.warn(`DISK SPACE WARNING: ${usagePercent}% used on ${DATA_DIR}`);
+          if (diskWritesBlocked) {
+            console.log(`Disk usage dropped below 95% (${usagePercent}%) — resuming blockstore writes`);
+            setDiskFull(false);
+            diskWritesBlocked = false;
+          }
+        } else {
+          if (diskWritesBlocked) {
+            console.log(`Disk usage recovered to ${usagePercent}% — resuming blockstore writes`);
+            setDiskFull(false);
+            diskWritesBlocked = false;
+          }
+        }
+      } catch (err) {
+        console.warn(`Disk space check failed: ${err.message}`);
+      }
+    };
+
+    // Check shortly after startup, then every 5 minutes
+    setTimeout(checkDiskSpace, 10_000);
+    setInterval(checkDiskSpace, 5 * 60_000);
+  }
 
   // Node registry cleanup — remove entries not updated within NODE_TTL_DAYS.
   const cleanupStaleNodes = async () => {
