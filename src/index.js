@@ -641,22 +641,20 @@ async function main() {
   // partial writes. Checks the filesystem containing DATA_DIR every 5 minutes.
   // At 90% capacity: warn. At 95%: block writes. Below 90%: resume writes.
   {
-    const { execSync } = await import("node:child_process");
+    const { statfs } = await import("node:fs/promises");
     let diskWritesBlocked = false;
 
-    const checkDiskSpace = () => {
+    const checkDiskSpace = async () => {
       try {
-        // Use df to get usage percentage for the filesystem containing DATA_DIR.
-        // -P forces POSIX output (single line per filesystem, consistent columns).
-        const output = execSync(`df -P "${DATA_DIR}"`, { encoding: "utf-8", timeout: 5000 });
-        const lines = output.trim().split("\n");
-        if (lines.length < 2) return;
-        // POSIX df columns: Filesystem 1024-blocks Used Available Capacity Mounted-on
-        const fields = lines[1].split(/\s+/);
-        const capacityStr = fields[4]; // e.g. "92%"
-        if (!capacityStr) return;
-        const usagePercent = parseInt(capacityStr.replace("%", ""), 10);
-        if (isNaN(usagePercent)) return;
+        const stats = await statfs(DATA_DIR);
+        const totalBlocks = stats.blocks;
+        const availableBlocks = stats.bavail; // blocks available to unprivileged users
+        if (totalBlocks === 0n && typeof totalBlocks === "bigint") return;
+        // statfs returns BigInt on some platforms, Number on others
+        const total = Number(totalBlocks);
+        const available = Number(availableBlocks);
+        if (total === 0) return;
+        const usagePercent = Math.round(((total - available) / total) * 100);
 
         if (usagePercent >= 95) {
           if (!diskWritesBlocked) {
