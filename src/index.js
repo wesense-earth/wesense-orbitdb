@@ -454,7 +454,8 @@ async function main() {
         const msg = err?.message || "";
         if (msg.includes("Failed to load block") ||
             msg.includes("Want was aborted") ||
-            msg.includes("CBOR decode error")) {
+            msg.includes("CBOR decode error") ||
+            msg.includes("permanently blacklisted")) {
           return true; // accept entry — write: ["*"] permits all writers
         }
         throw err;
