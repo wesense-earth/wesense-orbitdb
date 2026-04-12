@@ -255,8 +255,17 @@ export function wrapHeliaForOrbitDB(helia, options = {}) {
             throw new Error("Blockstore write rejected: disk space critically low");
           }
 
-          // Write the block
-          await origPut(cid, bytes, options);
+          // Write the block — catch disk-full errors and set the flag reactively
+          try {
+            await origPut(cid, bytes, options);
+          } catch (writeErr) {
+            const msg = (writeErr?.message || "").toLowerCase();
+            if (msg.includes("no space") || msg.includes("enospc") || msg.includes("disk full") || msg.includes("quota")) {
+              console.error("Blockstore write failed (disk full) — blocking all further writes");
+              diskFull = true;
+            }
+            throw writeErr;
+          }
 
           // Write-ahead verification: read back and verify hash matches CID
           try {
