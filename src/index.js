@@ -901,9 +901,26 @@ async function main() {
   // Startup walk: dial every peer already known in the local replica of
   // wesense.nodes. Delayed slightly so the bootstrap seed has a chance to
   // connect first and start sync before we start the walk.
+  //
+  // Wrapped in a timeout because dbs.nodes.all() can hang indefinitely
+  // when the oplog references blocks that neither the local store nor any
+  // connected peer holds (the "orphaned blocks" state — see Phase2Plan §4.4).
+  // Without the timeout, a single missing block would prevent any peer
+  // discovery from ever completing. With it, we make a best-effort walk and
+  // the event-driven path keeps working.
+  const REGISTRY_WALK_TIMEOUT_MS = 5000;
   const dialFromRegistryWalk = async () => {
+    const startedAt = Date.now();
     try {
-      const all = await dbs.nodes.all();
+      const all = await Promise.race([
+        dbs.nodes.all(),
+        new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error(`registry read timed out after ${REGISTRY_WALK_TIMEOUT_MS}ms`)),
+            REGISTRY_WALK_TIMEOUT_MS
+          )
+        ),
+      ]);
       let skippedNoAddr = 0;
       let skippedInternal = 0;
       let considered = 0;
@@ -922,10 +939,19 @@ async function main() {
       }
       console.log(
         `Registry walk: ${all.length} entries | ${considered} considered | ` +
-        `${skippedNoAddr} no announce_address | ${skippedInternal} internal`
+        `${skippedNoAddr} no announce_address | ${skippedInternal} internal ` +
+        `(${Date.now() - startedAt}ms)`
       );
     } catch (err) {
-      console.warn(`Registry walk error: ${err.message}`);
+      if (err.message?.includes("timed out")) {
+        console.warn(
+          `Registry walk timed out after ${Date.now() - startedAt}ms — ` +
+          `wesense.nodes iteration is blocked on missing/unreachable blocks. ` +
+          `Falling back to event-driven dialing only. See Phase2Plan §4.4 orphaned-blocks.`
+        );
+      } else {
+        console.warn(`Registry walk error: ${err.message}`);
+      }
     }
   };
   setTimeout(dialFromRegistryWalk, 10_000);
