@@ -495,17 +495,67 @@ async function main() {
     };
   }
 
-  // Workaround for libp2p@3 parallel startup race: if peers connected before
-  // gossipsub registered its topology, re-identify them so the peer:identify
-  // event fires again. If that still doesn't create streams, bypass the
-  // internal queue and call createOutboundStream directly.
+  // Ensure every connected peer has a healthy outbound gossipsub stream.
+  //
+  // Handles two failure modes:
+  //
+  // 1. libp2p@3 startup race: peers connect before gossipsub registers its
+  //    topology. We detect this via `outboundStreams < connectedPeers` and
+  //    re-identify the affected peers to trigger gossipsub's callback, then
+  //    manually call `createOutboundStream` as a bypass if that doesn't help.
+  //
+  // 2. Zombie streams: a peer's outbound stream was reset remotely (yamux
+  //    RESET frame) mid-flight. The `OutboundStream` entry still exists in
+  //    `pubsub.streamsOutbound`, but the underlying raw libp2p stream is
+  //    closed/reset and unusable. Gossipsub v14 has no independent stream-
+  //    close listener and its error callback only logs (upstream bug: pipe
+  //    error at @chainsafe/libp2p-gossipsub/dist/src/index.js:484 is a
+  //    no-op aside from logging), so the zombie entry sits there until the
+  //    TCP/yamux connection itself eventually dies. Between stream reset
+  //    and connection teardown, sync silently fails on that peer.
+  //
+  //    We detect zombies by checking the `rawStream.status` and
+  //    `rawStream.writeStatus` on each `streamsOutbound` entry. A healthy
+  //    stream is `status === 'open'` AND `writeStatus === 'writable'` —
+  //    anything else (closed, reset, aborted, closing) is a zombie. We
+  //    delete zombies from the map so the fix logic below treats the peer
+  //    as needing a fresh stream.
+  //
+  // See Phase2Plan §4.4 libp2p-stream-compat investigation for the full
+  // diagnosis and upstream PR plan.
   const ensureGossipsubStreams = async () => {
     const connectedPeers = helia.libp2p.getPeers();
-    const outboundStreams = pubsub.streamsOutbound?.size ?? 0;
-    if (connectedPeers.length === 0 || outboundStreams >= connectedPeers.length) {
-      return; // all peers already have gossipsub streams
+
+    // Zombie sweep — remove entries whose underlying stream is dead.
+    let zombiesRemoved = 0;
+    if (pubsub.streamsOutbound) {
+      for (const [id, outbound] of pubsub.streamsOutbound.entries()) {
+        const rawStream = outbound?.rawStream;
+        const healthy =
+          rawStream &&
+          rawStream.status === "open" &&
+          rawStream.writeStatus === "writable";
+        if (!healthy) {
+          console.warn(
+            `Gossipsub: zombie stream for ${id} ` +
+            `(status=${rawStream?.status ?? "no-stream"} ` +
+            `writeStatus=${rawStream?.writeStatus ?? "no-stream"}) — removing`
+          );
+          pubsub.streamsOutbound.delete(id);
+          zombiesRemoved++;
+        }
+      }
     }
-    console.log(`Gossipsub streams: ${outboundStreams}/${connectedPeers.length} — attempting to fix`);
+
+    const outboundStreams = pubsub.streamsOutbound?.size ?? 0;
+    if (connectedPeers.length === 0) return;
+    if (outboundStreams >= connectedPeers.length && zombiesRemoved === 0) {
+      return; // all peers have healthy streams
+    }
+    console.log(
+      `Gossipsub streams: ${outboundStreams}/${connectedPeers.length} — attempting to fix` +
+        (zombiesRemoved > 0 ? ` (${zombiesRemoved} zombie${zombiesRemoved > 1 ? "s" : ""} removed)` : "")
+    );
 
     // Step 1: Re-identify peers to trigger topology callbacks
     const identifySvc = helia.libp2p.services.identify;
@@ -568,6 +618,14 @@ async function main() {
   helia.libp2p.addEventListener("peer:connect", () => {
     setTimeout(ensureGossipsubStreams, 3_000);
   });
+
+  // Periodic zombie sweep. Stream resets on still-live connections don't
+  // fire peer:connect (the connection stays up even after a stream dies),
+  // so they'd otherwise sit as zombies until the connection eventually
+  // tears down. 10s is a reasonable detection window — short enough that
+  // sync loss is measured in seconds, not minutes; long enough not to burn
+  // CPU checking a steady-state mesh.
+  setInterval(ensureGossipsubStreams, 10_000);
 
   // Database replication event logging + error handling.
   // OrbitDB's sync module emits 'error' events when blocks can't be loaded
