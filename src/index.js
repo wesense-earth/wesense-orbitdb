@@ -904,9 +904,26 @@ async function main() {
   const dialFromRegistryWalk = async () => {
     try {
       const all = await dbs.nodes.all();
+      let skippedNoAddr = 0;
+      let skippedInternal = 0;
+      let considered = 0;
       for (const entry of all) {
-        await dialFromNodeDoc(entry.value, "registry-walk");
+        const doc = entry.value;
+        if (!doc || doc._id?.startsWith("__")) {
+          skippedInternal++;
+          continue;
+        }
+        if (!doc.announce_address) {
+          skippedNoAddr++;
+          continue;
+        }
+        considered++;
+        await dialFromNodeDoc(doc, "registry-walk");
       }
+      console.log(
+        `Registry walk: ${all.length} entries | ${considered} considered | ` +
+        `${skippedNoAddr} no announce_address | ${skippedInternal} internal`
+      );
     } catch (err) {
       console.warn(`Registry walk error: ${err.message}`);
     }
