@@ -10,7 +10,11 @@
  *
  * Peer discovery:
  *   - LAN: mDNS (zero config, requires network_mode: host in Docker)
- *   - WAN: Direct dial via ORBITDB_BOOTSTRAP_PEERS env var
+ *   - WAN: Direct dial via ORBITDB_BOOTSTRAP_PEERS env var as initial seed
+ *   - Propagation: gossipsub Peer Exchange (doPX) — once connected to any
+ *     peer, stations learn about the wider mesh automatically via graft/prune
+ *     PX messages. This is why every station only needs a handful of seed
+ *     addresses in ORBITDB_BOOTSTRAP_PEERS, not the full network roster.
  */
 
 // Must be imported before any helia/libp2p code to patch stream prototypes.
@@ -327,6 +331,22 @@ async function main() {
       pubsub: gossipsub({
         allowPublishToZeroTopicPeers: true,
         maxInboundDataLength: 2 * 1024 * 1024, // 2MB — reject oversized gossipsub messages
+        // Enable Peer Exchange (PX). When a station grafts/prunes a peer out of
+        // the mesh, PX messages include known-peer records (peer ID + addresses
+        // learned via Identify). This is how stations discover each other
+        // automatically without requiring every station to be listed in every
+        // other station's ORBITDB_BOOTSTRAP_PEERS. Without doPX, the manual
+        // bootstrap list is the ONLY way a station learns about peers.
+        // See docs/architecture/p2p-network.md §Node Discovery.
+        doPX: true,
+        // Peer records to include per PX message. 16 is the library default;
+        // declared explicitly so future readers know it's intentional.
+        // At very large scale this may want tuning — see Phase2Plan §4.4 Tier 2.
+        pxPeers: 16,
+        // NOTE: Gossipsub peer scoring is not configured (all peers score 0).
+        // PX still propagates correctly without scoring because every peer is
+        // a trusted WeSense station. Enabling scoreParams/scoreThresholds is
+        // deferred work — see Phase2Plan §4.4 Tier 2.
       }),
     },
   });
