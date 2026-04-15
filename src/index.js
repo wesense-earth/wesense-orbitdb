@@ -761,11 +761,23 @@ async function main() {
   setTimeout(cleanupStaleNodes, 30_000);
   setInterval(cleanupStaleNodes, 60 * 60_000);
 
-  // Direct peer dialing — for configured WeSense station addresses.
-  // Handles WAN discovery where mDNS can't reach (different networks, VPS).
-  // Filter out self-addresses: if ANNOUNCE_ADDRESS matches a configured peer's
-  // host, skip it — the node would be dialing itself. This is common when all
-  // nodes share the same ORBITDB_BOOTSTRAP_PEERS list that includes the bootstrap.
+  // Peer dialing has two modes that share the same safety/self-check logic:
+  //
+  //   1. Bootstrap seed (ORBITDB_BOOTSTRAP_PEERS) — periodic dial of the manually
+  //      configured peer list. Used for cold-start (when wesense.nodes is empty)
+  //      and for recovery if the registry-driven dialer hasn't re-established yet.
+  //
+  //   2. Registry-driven (wesense.nodes) — reacts to OrbitDB update events on the
+  //      node registry. When a station registers (or re-registers) with an
+  //      announce_address, we dial it. This is WeSense's native peer-discovery
+  //      mechanism — see wesense-docs/architecture/p2p-network.md §Node Discovery.
+  //
+  // Both modes converge on the same `tryDial()` which handles:
+  //   - self-check (don't dial our own announce address)
+  //   - already-connected check (don't re-dial an existing connection)
+  //   - penalty check (future hook for the trust/quality prioritisation framework
+  //     — see Phase2Plan §4.4; currently a no-op)
+
   const ownAddresses = new Set();
   if (ANNOUNCE_ADDRESS) {
     ownAddresses.add(ANNOUNCE_ADDRESS.toLowerCase());
@@ -785,63 +797,143 @@ async function main() {
       console.log(`Direct dial: Skipping self-address ${addr}`);
       return false;
     }
-    // Also try resolving dns4 addresses to check against our IP
     return true;
   });
 
-  if (filteredPeerAddrs.length > 0) {
-    const { multiaddr: createMa } = await import("@multiformats/multiaddr");
+  const { multiaddr: createMa } = await import("@multiformats/multiaddr");
+  const { lookup: dnsLookup } = await import("node:dns/promises");
 
-    // Resolve any dns4 addresses and filter out self after resolution
-    // Cache resolved self-addresses so we only log once per address
-    const resolvedSelfCache = new Set();
-    const resolvedSelfCheck = async (addr) => {
-      const host = addr.match(/\/dns4\/([^/]+)\//)?.[1];
-      if (host) {
-        try {
-          const { lookup } = await import("node:dns/promises");
-          const { address: resolvedIp } = await lookup(host);
-          if (ownAddresses.has(resolvedIp)) {
-            if (!resolvedSelfCache.has(addr)) {
-              resolvedSelfCache.add(addr);
-              console.log(`Direct dial: Skipping self-address ${addr} (resolved to ${resolvedIp})`);
-            }
-            return true;
+  // Resolve dns4 addresses and filter out self after resolution.
+  // Cache resolved self-addresses so we only log once per address.
+  const resolvedSelfCache = new Set();
+  const resolvedSelfCheck = async (addr) => {
+    const host = addr.match(/\/dns4\/([^/]+)\//)?.[1];
+    if (host) {
+      try {
+        const { address: resolvedIp } = await dnsLookup(host);
+        if (ownAddresses.has(resolvedIp)) {
+          if (!resolvedSelfCache.has(addr)) {
+            resolvedSelfCache.add(addr);
+            console.log(`Dial: Skipping self-address ${addr} (resolved to ${resolvedIp})`);
           }
-        } catch {}
-      }
-      return false;
-    };
+          return true;
+        }
+      } catch {}
+    }
+    return false;
+  };
 
+  const alreadyConnectedTo = (addr) => {
+    const targetHost = addr.match(/\/(?:ip4|dns4)\/([^/]+)\//)?.[1];
+    if (!targetHost) return false;
+    return helia.libp2p
+      .getConnections()
+      .some((c) => c.remoteAddr.toString().includes(targetHost));
+  };
+
+  // Placeholder for the future trust/quality prioritisation framework.
+  // See Phase2Plan §4.4 "Trust / quality prioritisation framework (deferred design)".
+  // When implemented, this should consult whatever state we end up using —
+  // likely fields on wesense.nodes records, or a separate wesense.peer_scores DB —
+  // and return true for peers that should not be dialed (revoked, misbehaving, etc.).
+  const isPenalised = (/* announceAddr, peerId */) => false;
+
+  const tryDial = async (addr, source) => {
+    if (await resolvedSelfCheck(addr)) return;
+    if (alreadyConnectedTo(addr)) return;
+    if (isPenalised(addr)) return;
+    try {
+      const ma = createMa(addr);
+      await helia.libp2p.dial(ma);
+      console.log(`Dial [${source}]: Connected to ${addr}`);
+    } catch (err) {
+      if (!err.message?.includes("dial self")) {
+        console.warn(`Dial [${source}]: Failed ${addr}: ${err.message}`);
+      }
+    }
+  };
+
+  // --- 1. Bootstrap-seed dialer ---
+
+  if (filteredPeerAddrs.length > 0) {
     const dialConfiguredPeers = async () => {
       for (const addr of filteredPeerAddrs) {
-        if (await resolvedSelfCheck(addr)) continue;
-
-        const targetHost = addr.match(/\/(?:ip4|dns4)\/([^/]+)\//)?.[1];
-        if (targetHost) {
-          const alreadyConnected = helia.libp2p
-            .getConnections()
-            .some((c) => c.remoteAddr.toString().includes(targetHost));
-          if (alreadyConnected) continue;
-        }
-
-        try {
-          const ma = createMa(addr);
-          await helia.libp2p.dial(ma);
-          console.log(`Direct dial: Connected to ${addr}`);
-        } catch (err) {
-          if (!err.message?.includes("dial self")) {
-            console.warn(`Direct dial: Failed ${addr}: ${err.message}`);
-          }
-        }
+        await tryDial(addr, "bootstrap-seed");
       }
     };
-
     setTimeout(dialConfiguredPeers, 5_000);
     setInterval(dialConfiguredPeers, 60_000);
-    console.log(`Direct peer dialing enabled for: ${filteredPeerAddrs.join(", ")}`);
+    console.log(`Bootstrap-seed dialing enabled for: ${filteredPeerAddrs.join(", ")}`);
   } else if (WESENSE_PEER_ADDRS.length > 0) {
-    console.log("All configured bootstrap peers are self-addresses — no outbound dialing");
+    console.log("All configured bootstrap peers are self-addresses — no outbound seeding");
+  }
+
+  // --- 2. Registry-driven dialer (wesense.nodes) ---
+
+  // Parse an announce_address field (as stored in wesense.nodes) into a
+  // full libp2p multiaddr string. Supports the same formats as
+  // ORBITDB_BOOTSTRAP_PEERS — full multiaddr, host:port, or bare host/IP.
+  const toMultiaddrFromAnnounce = (announceAddr) => {
+    if (!announceAddr || typeof announceAddr !== "string") return null;
+    if (announceAddr.startsWith("/")) return announceAddr; // already a multiaddr
+    let host, port;
+    if (announceAddr.includes(":")) {
+      [host, port] = announceAddr.split(":");
+    } else {
+      host = announceAddr;
+      port = LIBP2P_PORT;
+    }
+    if (!host) return null;
+    const proto = /^[\d.]+$/.test(host) ? "ip4" : "dns4";
+    return `/${proto}/${host}/tcp/${port}`;
+  };
+
+  // Dial a single node record from the registry if it has an announce_address.
+  const dialFromNodeDoc = async (doc, source) => {
+    if (!doc || doc._id?.startsWith("__")) return;
+    if (!doc.announce_address) return;
+    const ma = toMultiaddrFromAnnounce(doc.announce_address);
+    if (!ma) return;
+    const tag = doc.ingester_id || doc._id || "unknown";
+    await tryDial(ma, `${source}:${tag}`);
+  };
+
+  // Startup walk: dial every peer already known in the local replica of
+  // wesense.nodes. Delayed slightly so the bootstrap seed has a chance to
+  // connect first and start sync before we start the walk.
+  const dialFromRegistryWalk = async () => {
+    try {
+      const all = await dbs.nodes.all();
+      for (const entry of all) {
+        await dialFromNodeDoc(entry.value, "registry-walk");
+      }
+    } catch (err) {
+      console.warn(`Registry walk error: ${err.message}`);
+    }
+  };
+  setTimeout(dialFromRegistryWalk, 10_000);
+  // Also re-walk periodically as a safety net — covers cases where an
+  // event was missed (e.g. restart mid-sync). The event-driven path is
+  // primary; this is just belt-and-braces.
+  setInterval(dialFromRegistryWalk, 5 * 60_000);
+
+  // Event-driven: react to new or updated registry entries as soon as the
+  // OrbitDB CRDT delivers them.
+  dbs.nodes.events.on("update", async (entry) => {
+    try {
+      const op = entry?.payload?.op;
+      if (op === "DEL") return; // deletion — nothing to dial
+      await dialFromNodeDoc(entry?.payload?.value, "registry-event");
+    } catch (err) {
+      console.warn(`Registry-event dial error: ${err.message}`);
+    }
+  });
+
+  console.log("Registry-driven peer dialing enabled (watching wesense.nodes)");
+
+  // Keep this for the same else-if condition the legacy code had:
+  if (filteredPeerAddrs.length === 0 && WESENSE_PEER_ADDRS.length === 0) {
+    console.log("No bootstrap seed peers configured — relying on mDNS + registry-driven discovery");
   }
 
   // Express HTTP API — only accessible from Docker network (port 5200),
