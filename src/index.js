@@ -77,6 +77,35 @@ function isKnownSyncError(err) {
   return KNOWN_SYNC_ERRORS.some((pattern) => msg.includes(pattern));
 }
 
+// Some OrbitDB / libp2p / helia internal paths (p-queue task rejections,
+// sync-module event emitters) call `console.error(err)` directly with
+// Error objects, bypassing both our process.on('unhandledRejection') and
+// process.on('uncaughtException') handlers above. The result is raw Error
+// stack traces in logs for errors we already know are transient and
+// well-handled elsewhere.
+//
+// We intercept console.error to apply the same KNOWN_SYNC_ERRORS filter.
+// Matching errors collapse to a single-line "(intercepted, non-fatal)"
+// warning so logs stay readable; everything else passes through unchanged.
+//
+// Guard is narrow: only suppresses when a known-transient pattern appears
+// in the argument's message/stack/string representation. Unrecognised
+// errors are never hidden.
+const origConsoleError = console.error.bind(console);
+console.error = (...args) => {
+  if (args.length > 0) {
+    const combined = args
+      .map((a) => a?.message || a?.stack || (typeof a === "string" ? a : ""))
+      .join(" ");
+    if (KNOWN_SYNC_ERRORS.some((pattern) => combined.includes(pattern))) {
+      const firstMsg = args[0]?.message || String(args[0]);
+      console.warn(`OrbitDB sync error (intercepted, non-fatal): ${firstMsg}`);
+      return;
+    }
+  }
+  return origConsoleError(...args);
+};
+
 process.on("uncaughtException", (err) => {
   if (isKnownSyncError(err)) {
     console.warn(`OrbitDB sync error (uncaught, non-fatal): ${err.message}`);
@@ -310,6 +339,22 @@ async function main() {
     streamMuxers: [yamux({
       maxInboundStreams: 256,
       maxOutboundStreams: 256,
+      // Keep-alive and idle-timeout tuning to reduce spurious stream resets.
+      // Observed problem: streams get reset remotely (YamuxStream.onRemoteReset)
+      // mid-flight, usually after a period of low activity. Best theory is
+      // that the remote yamux is expiring streams it considers idle, or a
+      // middlebox in between is timing out the underlying TCP connection.
+      //
+      // Default enableKeepAlive is true; default keepAliveInterval is 30s.
+      // Lowering the interval to 10s sends keep-alives more often — a minor
+      // bandwidth cost for a meaningful reduction in "connection looks dead"
+      // false positives. Each keep-alive is a single yamux PING frame.
+      //
+      // See Phase2Plan §4.4 libp2p-stream-compat investigation — this is a
+      // tunable mitigation, not a root-cause fix. Local reproduction needed
+      // to actually identify why remote sends RESET.
+      enableKeepAlive: true,
+      keepAliveInterval: 10_000,
     })],
     transportManager: {
       // Don't crash if a listen address is temporarily in use (e.g. previous
@@ -1102,13 +1147,16 @@ async function main() {
   // wesense.nodes. Delayed slightly so the bootstrap seed has a chance to
   // connect first and start sync before we start the walk.
   //
-  // Wrapped in a timeout because dbs.nodes.all() can hang indefinitely
-  // when the oplog references blocks that neither the local store nor any
-  // connected peer holds (the "orphaned blocks" state — see Phase2Plan §4.4).
-  // Without the timeout, a single missing block would prevent any peer
-  // discovery from ever completing. With it, we make a best-effort walk and
-  // the event-driven path keeps working.
-  const REGISTRY_WALK_TIMEOUT_MS = 5000;
+  // Wrapped in a timeout to guard against pathological hangs. With the
+  // iteration-tolerance patches in the fork (traverse/heads skip entries
+  // whose blocks can't be fetched within a per-entry 2s limit), a hang
+  // should be unreachable — but the outer timeout stays as belt-and-braces
+  // insurance against bugs we haven't found yet.
+  //
+  // 30s gives the inner traversal comfortable headroom: a walk across
+  // ~15 poison entries at 2s each still completes under the wrapper.
+  // The walk only runs at startup + every 5 min; it's not a hot path.
+  const REGISTRY_WALK_TIMEOUT_MS = 30000;
   const dialFromRegistryWalk = async () => {
     const startedAt = Date.now();
     try {
