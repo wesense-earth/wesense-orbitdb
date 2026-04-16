@@ -928,6 +928,33 @@ async function main() {
   setTimeout(cleanupStaleNodes, 30_000);
   setInterval(cleanupStaleNodes, 60 * 60_000);
 
+  // Garbage-collect the lastSeenPeers map. The Map grows with every unique
+  // peer connection; without GC it would accumulate indefinitely. At 1M+
+  // peers seen over months of uptime this becomes meaningful memory.
+  //
+  // Entries older than NODE_TTL_DAYS no longer serve any purpose: they
+  // can't save a registry entry from cleanup (cleanupStaleNodes uses the
+  // same cutoff), so removing them changes nothing operationally.
+  //
+  // Bounded by NODE_TTL_DAYS regardless of network size — the Map size
+  // tracks "peers seen in the last N days", not all-time peers.
+  const cleanupLastSeenPeers = () => {
+    const cutoff = Date.now() - NODE_TTL_DAYS * 24 * 60 * 60 * 1000;
+    let removed = 0;
+    for (const [peerId, lastSeen] of lastSeenPeers) {
+      if (lastSeen < cutoff) {
+        lastSeenPeers.delete(peerId);
+        removed++;
+      }
+    }
+    if (removed > 0) {
+      console.log(`lastSeenPeers GC: removed ${removed} stale entries (now ${lastSeenPeers.size} tracked)`);
+    }
+  };
+  // Hourly is fine — the Map only matters at cleanupStaleNodes time, which
+  // also runs hourly. No urgency for tighter cadence.
+  setInterval(cleanupLastSeenPeers, 60 * 60_000);
+
   // Peer dialing has two modes that share the same safety/self-check logic:
   //
   //   1. Bootstrap seed (ORBITDB_BOOTSTRAP_PEERS) — periodic dial of the manually
