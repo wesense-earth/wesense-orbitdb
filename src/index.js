@@ -403,22 +403,28 @@ async function main() {
     streamMuxers: [yamux({
       maxInboundStreams: 256,
       maxOutboundStreams: 256,
-      // Keep-alive and idle-timeout tuning to reduce spurious stream resets.
-      // Observed problem: streams get reset remotely (YamuxStream.onRemoteReset)
-      // mid-flight, usually after a period of low activity. Best theory is
-      // that the remote yamux is expiring streams it considers idle, or a
-      // middlebox in between is timing out the underlying TCP connection.
-      //
-      // Default enableKeepAlive is true; default keepAliveInterval is 30s.
-      // Lowering the interval to 10s sends keep-alives more often — a minor
-      // bandwidth cost for a meaningful reduction in "connection looks dead"
-      // false positives. Each keep-alive is a single yamux PING frame.
-      //
-      // See Phase2Plan §4.4 libp2p-stream-compat investigation — this is a
-      // tunable mitigation, not a root-cause fix. Local reproduction needed
-      // to actually identify why remote sends RESET.
+      // Yamux connection-level keep-alive. Sends PING frames at the yamux
+      // layer to prevent middleboxes from treating the TCP connection as
+      // idle. Default keepAliveInterval is 30s; 10s is our tuned value.
       enableKeepAlive: true,
       keepAliveInterval: 10_000,
+      // Stream-level options. The `inactivityTimeout` here is the big one:
+      // libp2p's AbstractMessageStream will abort any stream that sees no
+      // activity within this window. Default is 120_000 (2 minutes), which
+      // is aggressive for our traffic pattern — gossipsub has no reason to
+      // traverse every outbound stream every 2 minutes in a small mesh, so
+      // idle streams were getting aborted, which the remote peer's yamux
+      // reflects as a RESET frame, producing the stream-reset churn we've
+      // been diagnosing (see Phase2Plan §4.4 Hypothesis 1).
+      //
+      // 30 minutes gives streams comfortable headroom while still being
+      // short enough that a genuinely-dead stream gets reclaimed within a
+      // reasonable window. The cost of a longer timeout is slightly more
+      // resident connection state per peer. At any scale this is cheap
+      // compared to the reconnect-cycle cost of the old 2-minute default.
+      streamOptions: {
+        inactivityTimeout: 30 * 60_000,
+      },
     })],
     transportManager: {
       // Don't crash if a listen address is temporarily in use (e.g. previous
