@@ -64,6 +64,12 @@ const KNOWN_SYNC_ERRORS = [
   "ECONNRESET",
   "The operation was aborted",
   "stream closed",
+  // helia-compat failure-cache errors — expected when the cache has learned
+  // a block is unreachable. Re-throwing these with full stack trace was
+  // flooding the logs with no diagnostic value; the cache's own one-line
+  // logging when it records the failure is sufficient.
+  "permanently blacklisted",
+  "unreachable (attempt",
 ];
 
 function isKnownSyncError(err) {

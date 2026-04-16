@@ -61,21 +61,69 @@ async function collectBytes(source) {
  *
  * After FAIL_COOLDOWN_MS, the CID is eligible for retry in case a peer
  * that has the block comes online. After MAX_ATTEMPTS cooldown cycles
- * (i.e. MAX_ATTEMPTS * FAIL_COOLDOWN_MS of trying), the CID is
- * permanently blacklisted and persisted to disk.
+ * the CID is moved to the long-term blacklist.
  */
 const FAIL_COOLDOWN_MS = 15 * 60 * 1000; // 15 minutes before retrying a failed CID
-const MAX_ATTEMPTS = 3; // permanently blacklist after this many failed cooldown cycles
+const MAX_ATTEMPTS = 3; // move to long-term blacklist after this many failed cooldown cycles
 const MAX_FAIL_CACHE_SIZE = 10000;
 const failedCids = new Map(); // CID string -> { failedAt, attempts }
 
-/** Permanent blacklist — CIDs that failed MAX_ATTEMPTS times are never retried. */
-let permanentBlacklist = new Map(); // CID string -> { blacklistedAt, attempts }
+/**
+ * Long-term blacklist — CIDs that reached MAX_ATTEMPTS failures are held
+ * here for BLACKLIST_TTL_MS before becoming retryable again.
+ *
+ * Design rationale: "never retry" is wrong for a distributed system where
+ * peers can legitimately be offline for days or weeks (hardware swap,
+ * vacation, ISP outage, storage migration). A block we could not fetch
+ * today might be fetchable next week when its holder comes back. At the
+ * same time, we don't want to retry continuously — that's what the cache
+ * is preventing.
+ *
+ * The TTL strikes a balance: blocks stay blacklisted long enough to avoid
+ * repeated futile fetches, but short enough that recovery is possible.
+ * 30 days matches the oplog TTL in the WeSense OrbitDB fork — entries
+ * older than that are filtered at read-time anyway, so a blacklist entry
+ * older than 30 days can't protect anything useful.
+ *
+ * On TTL expiry: the entry is removed from the blacklist, meaning the
+ * next access attempt goes back through the normal fetch path. If the
+ * block is still unreachable, it goes through the cooldown/blacklist
+ * cycle again from scratch. If it's now fetchable, it is fetched normally
+ * and the CID is effectively "unblacklisted".
+ *
+ * Also supports opt-out (set BLOCK_BLACKLIST_TTL_DAYS=0) for operators
+ * who want the previous "never retry" behaviour.
+ */
+const BLACKLIST_TTL_DAYS = parseFloat(process.env.BLOCK_BLACKLIST_TTL_DAYS || "30");
+const BLACKLIST_TTL_MS = BLACKLIST_TTL_DAYS > 0
+  ? BLACKLIST_TTL_DAYS * 24 * 60 * 60 * 1000
+  : Infinity; // 0 means "never expire"
+const BLACKLIST_SWEEP_INTERVAL_MS = 60 * 60 * 1000; // hourly sweep for expired entries
+
+let permanentBlacklist = new Map(); // CID string -> { blacklistedAt, attempts, manual? }
 let blacklistPath = null; // set by wrapHeliaForOrbitDB
 let blacklistDirty = false;
 
 /**
- * Load the permanent blacklist from disk.
+ * Returns true if a blacklist entry is expired and should be removed on
+ * next sweep. Entries with non-numeric or missing blacklistedAt default
+ * to "old" (expired immediately) so malformed records don't stick.
+ */
+function isBlacklistEntryExpired(entry, now = Date.now()) {
+  if (!Number.isFinite(BLACKLIST_TTL_MS)) return false; // TTL disabled
+  if (entry?.manual) return false; // manually blacklisted entries never expire
+  const blacklistedAt = entry?.blacklistedAt
+    ? new Date(entry.blacklistedAt).getTime()
+    : 0;
+  if (!Number.isFinite(blacklistedAt) || blacklistedAt === 0) return true;
+  return now - blacklistedAt > BLACKLIST_TTL_MS;
+}
+
+/**
+ * Load the blacklist from disk. Filters out entries whose TTL has expired
+ * since they were persisted — expired entries get a fresh retry chance on
+ * the next access attempt, rather than being stuck in the blacklist forever.
+ *
  * Called once at wrapper creation time.
  */
 async function loadBlacklist(filePath) {
@@ -85,12 +133,56 @@ async function loadBlacklist(filePath) {
       const raw = await readFile(filePath, "utf-8");
       const data = JSON.parse(raw);
       if (data && typeof data.entries === "object") {
-        permanentBlacklist = new Map(Object.entries(data.entries));
-        console.log(`Block blacklist loaded: ${permanentBlacklist.size} permanently blacklisted CIDs`);
+        const now = Date.now();
+        const loaded = new Map(Object.entries(data.entries));
+        let expiredOnLoad = 0;
+        for (const [cid, entry] of loaded) {
+          if (isBlacklistEntryExpired(entry, now)) {
+            loaded.delete(cid);
+            expiredOnLoad++;
+          }
+        }
+        permanentBlacklist = loaded;
+        if (expiredOnLoad > 0) {
+          blacklistDirty = true;
+          await saveBlacklist();
+        }
+        console.log(
+          `Block blacklist loaded: ${permanentBlacklist.size} blacklisted CIDs` +
+          (expiredOnLoad > 0 ? ` (${expiredOnLoad} expired on load and removed)` : "") +
+          (Number.isFinite(BLACKLIST_TTL_MS) ? ` (TTL ${BLACKLIST_TTL_DAYS}d)` : " (no TTL — never expire)")
+        );
       }
     }
   } catch (err) {
     console.warn(`Failed to load block blacklist from ${filePath}: ${err.message}`);
+  }
+}
+
+/**
+ * Remove expired blacklist entries. Expired CIDs become retryable on next
+ * access. Run periodically (hourly) to keep the in-memory set bounded to
+ * "still meaningful" entries.
+ *
+ * Started by wrapHeliaForOrbitDB; no need to invoke from outside.
+ */
+async function sweepExpiredBlacklist() {
+  if (!Number.isFinite(BLACKLIST_TTL_MS)) return; // TTL disabled
+  const now = Date.now();
+  let removed = 0;
+  for (const [cid, entry] of permanentBlacklist) {
+    if (isBlacklistEntryExpired(entry, now)) {
+      permanentBlacklist.delete(cid);
+      removed++;
+    }
+  }
+  if (removed > 0) {
+    blacklistDirty = true;
+    await saveBlacklist();
+    console.log(
+      `Block blacklist sweep: removed ${removed} expired entries ` +
+      `(${permanentBlacklist.size} remain; TTL ${BLACKLIST_TTL_DAYS}d)`
+    );
   }
 }
 
@@ -183,6 +275,12 @@ export function wrapHeliaForOrbitDB(helia, options = {}) {
   // don't block — the blacklist will be available shortly after startup).
   loadBlacklist(resolvedBlacklistPath);
 
+  // Periodically sweep expired blacklist entries. Makes previously-failed
+  // blocks retryable once BLACKLIST_TTL_MS has elapsed — important for a
+  // network where peers can legitimately be offline for extended periods
+  // and come back holding blocks we gave up on.
+  setInterval(sweepExpiredBlacklist, BLACKLIST_SWEEP_INTERVAL_MS);
+
   const origGet = helia.blockstore.get.bind(helia.blockstore);
   const origPut = helia.blockstore.put.bind(helia.blockstore);
   const origHas = helia.blockstore.has.bind(helia.blockstore);
@@ -220,14 +318,20 @@ export function wrapHeliaForOrbitDB(helia, options = {}) {
             const attempts = (prev?.attempts || 0) + 1;
 
             if (attempts >= MAX_ATTEMPTS) {
-              // Permanently blacklist this CID
+              // Move to long-term blacklist. Entry will be eligible for
+              // retry after BLACKLIST_TTL_MS — not truly "permanent", just
+              // held long enough to avoid futile retries while letting
+              // peers that were offline recover legitimately.
               permanentBlacklist.set(key, {
                 blacklistedAt: new Date().toISOString(),
                 attempts,
               });
               failedCids.delete(key);
               blacklistDirty = true;
-              console.warn(`Block ${key.slice(0, 20)}... permanently blacklisted after ${attempts} failed attempts`);
+              const ttlNote = Number.isFinite(BLACKLIST_TTL_MS)
+                ? `TTL ${BLACKLIST_TTL_DAYS}d`
+                : "no TTL";
+              console.warn(`Block ${key.slice(0, 20)}... blacklisted after ${attempts} failed attempts (${ttlNote})`);
               // Persist asynchronously — don't block the error path
               saveBlacklist();
             } else {
