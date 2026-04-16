@@ -132,9 +132,19 @@ setInterval(emitFilterSummary, FILTER_WINDOW_MS);
 const origConsoleError = console.error.bind(console);
 console.error = (...args) => {
   if (args.length > 0) {
-    const combined = args
-      .map((a) => a?.message || a?.stack || (typeof a === "string" ? a : ""))
-      .join(" ");
+    // Build a summary from all args so patterns can match regardless of
+    // which positional argument carries the useful text. Many code paths
+    // call console.error("[prefix]", errObj) where args[0] is a string
+    // label and the real error is in args[1] — we want to match on the
+    // combined content, and later we want to show the reader the same
+    // combined content (not just args[0], which would often be the label).
+    const argSummaries = args.map((a) => {
+      if (a?.message) return a.message;
+      if (a?.stack) return a.stack;
+      if (typeof a === "string") return a;
+      return String(a);
+    });
+    const combined = argSummaries.join(" ");
     const matchedPattern = KNOWN_SYNC_ERRORS.find((pattern) =>
       combined.includes(pattern)
     );
@@ -142,9 +152,15 @@ console.error = (...args) => {
       const count = (errorFilterState.counts.get(matchedPattern) || 0) + 1;
       errorFilterState.counts.set(matchedPattern, count);
       if (count === 1) {
-        const firstMsg = args[0]?.message || String(args[0]);
+        // Compose a single-line message that preserves all the diagnostic
+        // information. Truncate per-arg so pathological stacks don't blow
+        // out a single log line.
+        const MAX_PER_ARG = 400;
+        const shown = argSummaries
+          .map((s) => (s.length > MAX_PER_ARG ? s.slice(0, MAX_PER_ARG) + "…" : s))
+          .join(" ");
         console.warn(
-          `OrbitDB sync error (first in window, non-fatal): ${firstMsg}`
+          `OrbitDB sync error (first in window, non-fatal): ${shown}`
         );
       }
       // Subsequent in-window occurrences: silent, counted for summary.
