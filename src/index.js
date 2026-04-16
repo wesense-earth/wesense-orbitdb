@@ -84,22 +84,70 @@ function isKnownSyncError(err) {
 // stack traces in logs for errors we already know are transient and
 // well-handled elsewhere.
 //
-// We intercept console.error to apply the same KNOWN_SYNC_ERRORS filter.
-// Matching errors collapse to a single-line "(intercepted, non-fatal)"
-// warning so logs stay readable; everything else passes through unchanged.
+// We intercept console.error to apply the KNOWN_SYNC_ERRORS filter, but
+// with a windowed "first-seen + summary" policy rather than blanket
+// suppression. This keeps log noise minimal while preserving diagnostic
+// signal: an operator can always see (a) example instances of suppressed
+// patterns, (b) the rate at which they're occurring, and (c) any novel
+// patterns that happen to match the filter by accident — the first
+// occurrence per pattern per window always prints.
 //
-// Guard is narrow: only suppresses when a known-transient pattern appears
-// in the argument's message/stack/string representation. Unrecognised
-// errors are never hidden.
+// Window policy:
+//   - First occurrence of a pattern in the current window: logs as
+//     "OrbitDB sync error (first in window, non-fatal): <msg>"
+//   - Subsequent occurrences of the same pattern in the window: silent,
+//     counted
+//   - End of window (every 5 min): if any patterns hit, emits a summary
+//     line "OrbitDB sync error summary (last Ns): p1=C1, p2=C2, ..."
+//   - Unrecognised errors: always pass through to original console.error
+//
+// If suppressed-error rates spike or new patterns appear, both are
+// visible without needing to read through raw stack traces. If new
+// failure modes emerge that DON'T match existing patterns, they print
+// fully unchanged.
+const FILTER_WINDOW_MS = 5 * 60 * 1000;
+const errorFilterState = {
+  windowStart: Date.now(),
+  counts: new Map(), // pattern string → occurrences in current window
+};
+
+function emitFilterSummary() {
+  const elapsedMs = Date.now() - errorFilterState.windowStart;
+  if (errorFilterState.counts.size === 0) {
+    errorFilterState.windowStart = Date.now();
+    return;
+  }
+  const parts = [];
+  for (const [pattern, count] of errorFilterState.counts) {
+    parts.push(`"${pattern}"=${count}`);
+  }
+  console.warn(
+    `OrbitDB sync error summary (last ${Math.round(elapsedMs / 1000)}s): ${parts.join(", ")}`
+  );
+  errorFilterState.counts.clear();
+  errorFilterState.windowStart = Date.now();
+}
+setInterval(emitFilterSummary, FILTER_WINDOW_MS);
+
 const origConsoleError = console.error.bind(console);
 console.error = (...args) => {
   if (args.length > 0) {
     const combined = args
       .map((a) => a?.message || a?.stack || (typeof a === "string" ? a : ""))
       .join(" ");
-    if (KNOWN_SYNC_ERRORS.some((pattern) => combined.includes(pattern))) {
-      const firstMsg = args[0]?.message || String(args[0]);
-      console.warn(`OrbitDB sync error (intercepted, non-fatal): ${firstMsg}`);
+    const matchedPattern = KNOWN_SYNC_ERRORS.find((pattern) =>
+      combined.includes(pattern)
+    );
+    if (matchedPattern) {
+      const count = (errorFilterState.counts.get(matchedPattern) || 0) + 1;
+      errorFilterState.counts.set(matchedPattern, count);
+      if (count === 1) {
+        const firstMsg = args[0]?.message || String(args[0]);
+        console.warn(
+          `OrbitDB sync error (first in window, non-fatal): ${firstMsg}`
+        );
+      }
+      // Subsequent in-window occurrences: silent, counted for summary.
       return;
     }
   }
@@ -1147,32 +1195,37 @@ async function main() {
   // wesense.nodes. Delayed slightly so the bootstrap seed has a chance to
   // connect first and start sync before we start the walk.
   //
-  // Wrapped in a timeout to guard against pathological hangs. With the
-  // iteration-tolerance patches in the fork (traverse/heads skip entries
-  // whose blocks can't be fetched within a per-entry 2s limit), a hang
-  // should be unreachable — but the outer timeout stays as belt-and-braces
-  // insurance against bugs we haven't found yet.
+  // Uses the Documents iterator() (lazy yield, one entry at a time) rather
+  // than all() (collects everything before returning). This matters when a
+  // station has accumulated many poisoned oplog entries: the inner
+  // traverse()+safeFetchEntry() yields healthy entries immediately and
+  // skips unreachable ones at 2s each. With iterator(), we process each
+  // yielded doc as it arrives; with all(), we'd wait for the full set to
+  // materialise (potentially minutes, exceeding any reasonable deadline).
   //
-  // 30s gives the inner traversal comfortable headroom: a walk across
-  // ~15 poison entries at 2s each still completes under the wrapper.
-  // The walk only runs at startup + every 5 min; it's not a hot path.
+  // We enforce a soft deadline between yielded entries so the walk can't
+  // run forever on extremely poisoned stations. If we hit the deadline,
+  // we stop cleanly with whatever we processed — "partial results" rather
+  // than "no results". The event-driven dialer catches anything we missed
+  // when the remaining entries eventually arrive via sync updates.
   const REGISTRY_WALK_TIMEOUT_MS = 30000;
   const dialFromRegistryWalk = async () => {
     const startedAt = Date.now();
+    const deadline = startedAt + REGISTRY_WALK_TIMEOUT_MS;
+    let entriesSeen = 0;
+    let considered = 0;
+    let skippedNoAddr = 0;
+    let skippedInternal = 0;
+    let partial = false;
+
     try {
-      const all = await Promise.race([
-        dbs.nodes.all(),
-        new Promise((_, reject) =>
-          setTimeout(
-            () => reject(new Error(`registry read timed out after ${REGISTRY_WALK_TIMEOUT_MS}ms`)),
-            REGISTRY_WALK_TIMEOUT_MS
-          )
-        ),
-      ]);
-      let skippedNoAddr = 0;
-      let skippedInternal = 0;
-      let considered = 0;
-      for (const entry of all) {
+      const iter = dbs.nodes.iterator({ amount: -1 });
+      for await (const entry of iter) {
+        if (Date.now() > deadline) {
+          partial = true;
+          break;
+        }
+        entriesSeen++;
         const doc = entry.value;
         if (!doc || doc._id?.startsWith("__")) {
           skippedInternal++;
@@ -1185,21 +1238,18 @@ async function main() {
         considered++;
         await dialFromNodeDoc(doc, "registry-walk");
       }
+      const elapsed = Date.now() - startedAt;
+      const suffix = partial
+        ? ` (partial — deadline ${REGISTRY_WALK_TIMEOUT_MS}ms reached; ` +
+          `event-driven path handles the rest)`
+        : "";
       console.log(
-        `Registry walk: ${all.length} entries | ${considered} considered | ` +
+        `Registry walk: ${entriesSeen} entries processed | ${considered} considered | ` +
         `${skippedNoAddr} no announce_address | ${skippedInternal} internal ` +
-        `(${Date.now() - startedAt}ms)`
+        `(${elapsed}ms)${suffix}`
       );
     } catch (err) {
-      if (err.message?.includes("timed out")) {
-        console.warn(
-          `Registry walk timed out after ${Date.now() - startedAt}ms — ` +
-          `wesense.nodes iteration is blocked on missing/unreachable blocks. ` +
-          `Falling back to event-driven dialing only. See Phase2Plan §4.4 orphaned-blocks.`
-        );
-      } else {
-        console.warn(`Registry walk error: ${err.message}`);
-      }
+      console.warn(`Registry walk error: ${err.message}`);
     }
   };
   setTimeout(dialFromRegistryWalk, 10_000);
