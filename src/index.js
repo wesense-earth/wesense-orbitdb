@@ -458,6 +458,56 @@ async function main() {
     }
   }
 
+  // Self-register this OrbitDB peer in wesense.nodes so other stations can
+  // discover and dial us via the registry-driven dialer.
+  //
+  // Without this, wesense.nodes only contains records written by data
+  // services (storage-broker, ingesters) which carry their own iroh / zenoh
+  // endpoints, NOT libp2p peer addresses. The registry-driven dialer
+  // (see further down) needs `announce_address` populated to dial peers,
+  // so without self-registration it has nothing useful to act on.
+  //
+  // Written once on startup. This is intentional rather than periodic:
+  //   1. Catches changes to ANNOUNCE_ADDRESS (env var changes take effect
+  //      on the next restart, which is when we want the registry updated)
+  //   2. Avoids continuous oplog growth at scale — at 1M peers, hourly
+  //      re-registration would mean 1M extra oplog entries per hour
+  //
+  // Caveat: wesense-orbitdb has a node-cleanup loop (cleanupStaleNodes,
+  // below) that prunes records whose updated_at is older than
+  // NODE_TTL_DAYS (default 7 days). If a station runs continuously for
+  // longer than NODE_TTL_DAYS without restart, its self-registration will
+  // be pruned and other peers won't see it. Operators who expect long
+  // uninterrupted uptime should set NODE_TTL_DAYS to comfortably cover
+  // their typical maintenance interval (e.g. 30 days to align with the
+  // OrbitDB oplog TTL).
+  //
+  // See wesense-general-docs Phase2Plan §4.4 for the registry-driven
+  // dialer design and the discussion of why self-registration was missing.
+  if (ANNOUNCE_ADDRESS) {
+    try {
+      const selfPeerId = helia.libp2p.peerId.toString();
+      await dbs.nodes.put({
+        _id: selfPeerId,
+        ingester_id: selfPeerId,
+        announce_address: ANNOUNCE_ADDRESS,
+        type: "orbitdb-peer",
+        updated_at: new Date().toISOString(),
+      });
+      console.log(
+        `Self-registered as orbitdb-peer in wesense.nodes ` +
+        `(peer_id=${selfPeerId}, announce_address=${ANNOUNCE_ADDRESS})`
+      );
+    } catch (err) {
+      console.warn(`Self-registration in wesense.nodes failed: ${err.message}`);
+    }
+  } else {
+    console.log(
+      "ANNOUNCE_ADDRESS not set — skipping self-registration in wesense.nodes. " +
+      "This peer will not be discoverable by other stations via the registry."
+    );
+  }
+
   // Patch access controllers to tolerate missing identity blocks.
   // Old oplog entries created before the helia-compat.js fix have identity
   // blocks that were corrupted by helia v6's streaming blockstore. These
