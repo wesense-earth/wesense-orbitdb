@@ -6,7 +6,7 @@
     "start": "node src/index.js"
   },
   "dependencies": {
-    "@orbitdb/core": "git+https://github.com/wesense-earth/orbitdb.git#feat/ttl",
+    "@orbitdb/core": "git+https://github.com/wesense-earth/orbitdb.git#wesense-main",
     "helia": "^6.0.0",
     "@chainsafe/libp2p-noise": "^17.0.0",
     "@chainsafe/libp2p-yamux": "^8.0.0",
