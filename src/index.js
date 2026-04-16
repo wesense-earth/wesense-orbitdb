@@ -1235,7 +1235,13 @@ async function main() {
     let partial = false;
 
     try {
-      const iter = dbs.nodes.iterator({ amount: -1 });
+      // NB: do NOT pass { amount: -1 } here — the Documents iterator checks
+      // `if (count >= amount) break`, and `1 >= -1` is true, so passing -1
+      // causes the walk to stop after the first entry. With no argument,
+      // `amount` is undefined and the comparison is always false, so we
+      // iterate everything. (The Log iterator uses amount=-1 as "unlimited"
+      // semantics, but the Documents iterator on top of it does not.)
+      const iter = dbs.nodes.iterator();
       for await (const entry of iter) {
         if (Date.now() > deadline) {
           partial = true;
