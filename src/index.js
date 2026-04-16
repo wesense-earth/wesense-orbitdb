@@ -388,12 +388,35 @@ async function main() {
     );
   });
 
-  // Log peer connections and disconnections
+  // Local view of when we last saw each peer's libp2p activity. Used by the
+  // node-cleanup loop (cleanupStaleNodes) to keep a peer's wesense.nodes
+  // entry alive as long as we're still hearing from them on the network,
+  // even if their entry's `updated_at` is older than NODE_TTL_DAYS.
+  //
+  // Why: a long-running OrbitDB peer self-registers once on startup. If it
+  // runs for longer than NODE_TTL_DAYS without restart, the cleanup loop
+  // would prune its entry — making it invisible to other peers in the
+  // registry-driven dialer — even though it's still actively present and
+  // reachable. Network presence (peer:connect events) is the truer signal
+  // of "this node is still here" than the staleness of a registration
+  // timestamp the node wrote weeks ago.
+  //
+  // Local-only state: NOT replicated via OrbitDB. Each station maintains
+  // its own view of which peers it has personally seen.
+  const lastSeenPeers = new Map(); // peerId (string) -> last-seen timestamp (ms)
+
+  // Log peer connections and disconnections; record contact for the
+  // presence-aware cleanup logic below.
   helia.libp2p.addEventListener("peer:connect", (evt) => {
-    console.log(`Peer connected: ${evt.detail.toString()}`);
+    const peerId = evt.detail.toString();
+    lastSeenPeers.set(peerId, Date.now());
+    console.log(`Peer connected: ${peerId}`);
   });
   helia.libp2p.addEventListener("peer:disconnect", (evt) => {
-    console.log(`Peer disconnected: ${evt.detail.toString()}`);
+    const peerId = evt.detail.toString();
+    // Refresh on disconnect too — they were here right up until disconnect.
+    lastSeenPeers.set(peerId, Date.now());
+    console.log(`Peer disconnected: ${peerId}`);
   });
 
   // Helia v6 changed blockstore.get() to return AsyncGenerator<Uint8Array>
@@ -844,23 +867,59 @@ async function main() {
     setInterval(compactAll, 24 * 60 * 60_000);
   }
 
-  // Node registry cleanup — remove entries not updated within NODE_TTL_DAYS.
+  // Node registry cleanup — remove entries we genuinely haven't heard from
+  // within NODE_TTL_DAYS.
+  //
+  // "Heard from" = either:
+  //   1. The entry's own updated_at is recent (the writer has refreshed it), OR
+  //   2. The entry's ingester_id matches a peer we've seen on the libp2p
+  //      network within the TTL window (lastSeenPeers map).
+  //
+  // (1) covers data services like storage-broker / ingesters that
+  // periodically rewrite their own records to keep them fresh. (2) covers
+  // long-running OrbitDB peers that self-register on startup only — they
+  // remain visibly present on the network even if their registration
+  // record's timestamp is old.
+  //
+  // Without (2), a peer that ran continuously past NODE_TTL_DAYS would
+  // have its entry pruned and would disappear from other peers' views of
+  // the registry — even though the peer itself is still actively reachable.
+  // That's the wrong semantic. TTL should mean "we haven't seen this node",
+  // not "this node hasn't bothered to re-write its registration".
   const cleanupStaleNodes = async () => {
     try {
       const cutoff = Date.now() - NODE_TTL_DAYS * 24 * 60 * 60 * 1000;
       const allEntries = await dbs.nodes.all();
       let removed = 0;
+      let kept_via_presence = 0;
       for (const entry of allEntries) {
         const doc = entry.value;
         if (!doc || doc._id?.startsWith("__")) continue;
         const updatedAt = doc.updated_at ? new Date(doc.updated_at).getTime() : 0;
-        if (updatedAt < cutoff) {
-          await dbs.nodes.del(doc._id);
-          removed++;
+        if (updatedAt >= cutoff) continue; // (1) recent updated_at — keep
+
+        // (2) check whether we've seen this peer on the network recently.
+        // Applies primarily to orbitdb-peer entries (whose ingester_id is
+        // a libp2p peer ID), but the map lookup is safe for any value —
+        // non-peer ids simply won't be present in lastSeenPeers.
+        const candidatePeerId = doc.ingester_id;
+        if (candidatePeerId && lastSeenPeers.has(candidatePeerId)) {
+          const lastSeen = lastSeenPeers.get(candidatePeerId);
+          if (lastSeen >= cutoff) {
+            kept_via_presence++;
+            continue; // recently seen — keep entry alive
+          }
         }
+
+        await dbs.nodes.del(doc._id);
+        removed++;
       }
-      if (removed > 0) {
-        console.log(`Node cleanup: removed ${removed} stale entries (TTL: ${NODE_TTL_DAYS}d)`);
+      if (removed > 0 || kept_via_presence > 0) {
+        console.log(
+          `Node cleanup: removed ${removed} stale entries, ` +
+          `kept ${kept_via_presence} via recent network presence ` +
+          `(TTL: ${NODE_TTL_DAYS}d)`
+        );
       }
     } catch (err) {
       console.warn(`Node cleanup error: ${err.message}`);
