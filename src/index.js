@@ -1279,6 +1279,17 @@ async function main() {
           partial = true;
           break;
         }
+        // Yield to the event loop between entries. Without this, the walk
+        // monopolises the event loop for its entire duration (13+ seconds
+        // on poisoned stations). During that time, yamux keepalive PINGs
+        // can't send, the remote sees silence, and connections get RST'd.
+        // Investigation 2026-04-17 showed disconnects correlate exactly
+        // with the walk's firing interval — the walk was starving yamux.
+        //
+        // setTimeout(0) defers to the next macrotask, letting any queued
+        // I/O callbacks (including yamux PING responses and gossipsub
+        // heartbeats) run before we process the next entry.
+        await new Promise((resolve) => setTimeout(resolve, 0));
         entriesSeen++;
         const doc = entry.value;
         if (!doc || doc._id?.startsWith("__")) {
@@ -1311,14 +1322,10 @@ async function main() {
   // event was missed (e.g. restart mid-sync). The event-driven path is
   // primary; this is just belt-and-braces.
   //
-  // NOTE: on stations with many poisoned entries, each walk takes 13+ seconds
-  // of heavy I/O (safeFetchEntry timeouts, DNS lookups, dial attempts).
-  // Investigation 2026-04-17 showed disconnects correlate exactly with the
-  // 5-minute walk interval — the walk likely starves yamux keepalive,
-  // causing the remote to drop the connection. Increased to 30 minutes
-  // pending proper fix (either reduce walk I/O or yield to the event loop
-  // between entries).
-  setInterval(dialFromRegistryWalk, 30 * 60_000);
+  // The walk now yields to the event loop between entries (setTimeout(0)
+  // in the loop body), so it's safe at any frequency — yamux keepalive
+  // PINGs and gossipsub heartbeats can fire between entry processing.
+  setInterval(dialFromRegistryWalk, 5 * 60_000);
 
   // Event-driven: react to new or updated registry entries as soon as the
   // OrbitDB CRDT delivers them.
