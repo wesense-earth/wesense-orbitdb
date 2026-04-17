@@ -1310,7 +1310,15 @@ async function main() {
   // Also re-walk periodically as a safety net — covers cases where an
   // event was missed (e.g. restart mid-sync). The event-driven path is
   // primary; this is just belt-and-braces.
-  setInterval(dialFromRegistryWalk, 5 * 60_000);
+  //
+  // NOTE: on stations with many poisoned entries, each walk takes 13+ seconds
+  // of heavy I/O (safeFetchEntry timeouts, DNS lookups, dial attempts).
+  // Investigation 2026-04-17 showed disconnects correlate exactly with the
+  // 5-minute walk interval — the walk likely starves yamux keepalive,
+  // causing the remote to drop the connection. Increased to 30 minutes
+  // pending proper fix (either reduce walk I/O or yield to the event loop
+  // between entries).
+  setInterval(dialFromRegistryWalk, 30 * 60_000);
 
   // Event-driven: react to new or updated registry entries as soon as the
   // OrbitDB CRDT delivers them.
