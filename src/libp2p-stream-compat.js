@@ -1,7 +1,7 @@
 /**
  * libp2p@3 compatibility shim for gossipsub@14 and OrbitDB@3.
  *
- * Two breaking changes in libp2p@3 (shipped with helia@6) affect these modules:
+ * Two breaking changes in libp2p@3 (shipped with helia@6) affect our stack:
  *
  * 1. STREAM DUPLEX: Streams changed from duplex ({sink, source}) to event-based
  *    ({send(), [Symbol.asyncIterator]}). gossipsub@14 and OrbitDB@3 use it-pipe
@@ -10,9 +10,24 @@
  *
  * 2. HANDLER SIGNATURE: Protocol stream handlers changed from
  *    handler({stream, connection}) to handler(stream, connection).
- *    gossipsub@14 and OrbitDB@3 destructure a single object arg, receiving
- *    undefined for both stream and connection — silently breaking inbound streams.
- *    Fix: wrap the registrar.handle() to convert args for affected protocols.
+ *    @chainsafe/libp2p-gossipsub@14 still uses the old single-object form
+ *    (see node_modules/@chainsafe/libp2p-gossipsub/dist/src/index.js:435
+ *    `onIncomingStream({ stream, connection }) {...}`) so its /meshsub/ and
+ *    /floodsub/ handlers need wrapping.
+ *
+ *    OrbitDB (our wesense-main fork) uses the NEW two-arg form — see
+ *    orbitdb-fork/src/sync.js:173 `handleReceiveHeads = async (stream,
+ *    connection) => { const peerId = String(connection.remotePeer) ... }`.
+ *    Wrapping its `/orbitdb/*` handlers with `handler({stream, connection})`
+ *    packs the two args into a single object, which the fork then receives as
+ *    its first positional arg, leaving `connection` undefined and throwing
+ *    `TypeError: Cannot read properties of undefined (reading 'remotePeer')`.
+ *    Historic note: `/orbitdb/` used to be in the wrapped list based on the
+ *    assumption that OrbitDB still used the old signature; removed 2026-04-17
+ *    after the teardown-trace investigation surfaced 15–18 TypeErrors per
+ *    30 min in production logs.
+ *
+ *    Fix: wrap gossipsub protocols; leave OrbitDB alone.
  *
  * Import this module BEFORE creating any Helia/libp2p instances.
  * Call patchRegistrarForLegacyHandlers(libp2p) after createLibp2p({start:false})
@@ -72,13 +87,13 @@ export function patchRegistrarForLegacyHandlers(libp2p) {
   const origHandle = registrar.handle.bind(registrar);
 
   registrar.handle = async (protocol, handler, opts) => {
-    // gossipsub and OrbitDB protocols use the old IncomingStreamData
-    // signature: handler({stream, connection}). Wrap them to accept
-    // the libp2p@3 signature: handler(stream, connection).
+    // gossipsub@14 still uses the old IncomingStreamData signature:
+    // handler({stream, connection}). Wrap its protocols to accept the
+    // libp2p@3 signature: handler(stream, connection). Do NOT wrap
+    // /orbitdb/* — the fork already uses the new two-arg signature.
     if (
       protocol.startsWith("/meshsub/") ||
-      protocol.startsWith("/floodsub/") ||
-      protocol.startsWith("/orbitdb/")
+      protocol.startsWith("/floodsub/")
     ) {
       const wrappedHandler = (stream, connection) => {
         return handler({ stream, connection });
