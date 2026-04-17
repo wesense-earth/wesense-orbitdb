@@ -60,7 +60,7 @@ try {
   const obs = new PerformanceObserver((list) => {
     for (const entry of list.getEntries()) {
       if (entry.duration >= GC_PAUSE_WARN_MS) {
-        const kind = gcKindNames[entry.detail?.kind] || `kind-${entry.detail?.kind}`;
+        const kind = gcKindNames[entry.detail?.kind ?? entry.kind] || `kind-${entry.detail?.kind ?? entry.kind ?? "?"}`;
         console.warn(
           `GC PAUSE: ${kind} ${entry.duration.toFixed(0)}ms` +
           (entry.duration >= 1000 ? " ⚠️ >1s — event loop was stalled" : "")
@@ -68,7 +68,10 @@ try {
       }
     }
   });
-  obs.observe({ type: "gc", buffered: false });
+  // entryTypes (plural) is the classic API; type (singular) is newer.
+  // Using entryTypes for broader Node version compatibility.
+  obs.observe({ entryTypes: ["gc"] });
+  console.log(`GC pause monitoring active (threshold: ${GC_PAUSE_WARN_MS}ms)`);
 } catch (err) {
   console.warn(`GC monitoring unavailable: ${err.message}`);
 }
