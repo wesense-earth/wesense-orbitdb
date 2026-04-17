@@ -1281,6 +1281,15 @@ async function main() {
   const dialFromNodeDoc = async (doc, source) => {
     if (!doc || doc._id?.startsWith("__")) return;
     if (!doc.announce_address) return;
+    // Skip self by peer ID. Our self-registration writes ingester_id =
+    // this.libp2p.peerId.toString(), so comparing strings is correct and cheap.
+    // tryDial also has an address-based self-check (resolvedSelfCheck) but it
+    // misses edge cases: NAT hairpin, IPv4/IPv6 route mismatch, stale DNS, or
+    // a multihomed announce. In those cases libp2p detects self via peer ID
+    // during the noise handshake and rejects — but by then we've burnt a full
+    // TCP + noise round-trip and produced an ~8-event abort cascade. Cheaper
+    // and cleaner to bail out here when we already know the target peer ID.
+    if (doc.ingester_id && doc.ingester_id === helia.libp2p.peerId.toString()) return;
     const ma = toMultiaddrFromAnnounce(doc.announce_address);
     if (!ma) return;
     const tag = doc.ingester_id || doc._id || "unknown";
