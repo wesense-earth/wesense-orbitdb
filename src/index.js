@@ -19,11 +19,20 @@
 
 // Must be imported before any helia/libp2p code to patch stream prototypes.
 import { patchRegistrarForLegacyHandlers } from "./libp2p-stream-compat.js";
+import { installTeardownTrace, wrapYamux } from "./teardown-trace.js";
+
+// Patch AbstractMessageStream.abort/close before any connections are
+// constructed. No-op unless TEARDOWN_TRACE env var is set. See
+// StreamResetInvestigation.md.
+installTeardownTrace();
 
 import { createHelia } from "helia";
 import { createLibp2p } from "libp2p";
 import { noise } from "@chainsafe/libp2p-noise";
-import { yamux } from "@chainsafe/libp2p-yamux";
+import { yamux as rawYamux } from "@chainsafe/libp2p-yamux";
+// Lazy-patches YamuxMuxer.prototype on first muxer instance. Identity
+// function when TEARDOWN_TRACE is unset.
+const yamux = wrapYamux(rawYamux);
 import { tcp } from "@libp2p/tcp";
 import { mdns } from "@libp2p/mdns";
 import { gossipsub } from "@chainsafe/libp2p-gossipsub";
