@@ -43,6 +43,36 @@ import { createNodesRouter } from "./routes/nodes.js";
 import { createTrustRouter } from "./routes/trust.js";
 import { createStoresRouter } from "./routes/stores.js";
 import { createHealthRouter } from "./routes/health.js";
+
+// GC pause monitoring via perf_hooks (no NODE_OPTIONS flags required).
+// Logs any GC event longer than GC_PAUSE_WARN_MS so we can correlate with
+// connection deaths. The hypothesis (Phase2Plan §4.4): long Mark-Compact
+// pauses stall the event loop, queued writes flush on unblock, then a
+// timeout callback fires and destroys the connection — producing the
+// stream-reset churn we observe in production.
+//
+// Set GC_PAUSE_WARN_MS=0 to log ALL GC events (very noisy).
+// Set GC_PAUSE_WARN_MS=99999 to effectively disable (silent).
+const GC_PAUSE_WARN_MS = parseInt(process.env.GC_PAUSE_WARN_MS || "100", 10);
+try {
+  const { PerformanceObserver } = await import("node:perf_hooks");
+  const gcKindNames = { 1: "Scavenge", 2: "Mark-Compact", 4: "Incremental", 8: "Weak-Phantom" };
+  const obs = new PerformanceObserver((list) => {
+    for (const entry of list.getEntries()) {
+      if (entry.duration >= GC_PAUSE_WARN_MS) {
+        const kind = gcKindNames[entry.detail?.kind] || `kind-${entry.detail?.kind}`;
+        console.warn(
+          `GC PAUSE: ${kind} ${entry.duration.toFixed(0)}ms` +
+          (entry.duration >= 1000 ? " ⚠️ >1s — event loop was stalled" : "")
+        );
+      }
+    }
+  });
+  obs.observe({ type: "gc", buffered: false });
+} catch (err) {
+  console.warn(`GC monitoring unavailable: ${err.message}`);
+}
+
 // OrbitDB's sync module emits errors via EventEmitter and also throws errors
 // that escape pipe()/try-catch as uncaught exceptions or unhandled rejections.
 // Known transient errors that should not crash the process:
