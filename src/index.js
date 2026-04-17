@@ -554,15 +554,21 @@ async function main() {
 
   // Dial peers discovered via mDNS. On this network every discovered peer
   // is another WeSense station — there are no IPFS bootstrap nodes.
+  //
+  // Skip self: mDNS announcements include our own node (the mdns service
+  // advertises locally AND listens for advertisements, which loops back
+  // on the same host). Without this filter, every announcement produces a
+  // futile dial → Upgrader reject → Noise close → abort cascade. In 30 min
+  // on station3 that was ~48 events (see F3 in StreamResetInvestigation.md).
+  const selfPeerId = helia.libp2p.peerId;
   helia.libp2p.addEventListener("peer:discovery", (evt) => {
     const discoveredId = evt.detail.id;
+    if (discoveredId.equals(selfPeerId)) return;
     if (helia.libp2p.getPeers().some((p) => p.equals(discoveredId))) return;
     helia.libp2p.dial(discoveredId).then(
       () => console.log(`mDNS: Connected to ${discoveredId}`),
       (err) => {
-        if (!err.message?.includes("dial self")) {
-          console.warn(`mDNS: Failed to dial ${discoveredId}: ${err.message}`);
-        }
+        console.warn(`mDNS: Failed to dial ${discoveredId}: ${err.message}`);
       }
     );
   });
