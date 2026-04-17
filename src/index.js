@@ -398,22 +398,12 @@ async function main() {
       listen: [`/ip4/0.0.0.0/tcp/${LIBP2P_PORT}`],
       announce,
     },
-    transports: [tcp({
-      // Hypothesis 2 test (Phase2Plan §4.4): the TCP transport has its own
-      // socket-level inactivity timeout that can close the underlying
-      // socket even while higher layers think the connection is healthy.
-      // When the socket dies, yamux (above) sees all its streams reset
-      // simultaneously — producing the observed stream-reset churn.
-      //
-      // Default values are ~2.5 minutes. Bumping to 30 minutes matches
-      // the headroom we want for genuinely-idle-but-alive connections.
-      // Yamux keepalive at 10s SHOULD defeat this timer (keepalive PINGs
-      // count as socket activity), but making it explicit removes one
-      // variable. If H2 is not the cause, revert these along with any
-      // other unsuccessful tests.
-      outboundSocketInactivityTimeout: 30 * 60_000,
-      inboundSocketInactivityTimeout: 30 * 60_000,
-    })],
+    // NOTE: Hypothesis 2 (bumping TCP transport socket inactivity timeouts
+    // to 30min) was tested 2026-04-17 and eliminated — no improvement on
+    // 4/5 hosts. Yamux keepalive at 10s already prevents TCP-level idle
+    // timeout from firing, so bumping it was a no-op. Default restored.
+    // See Phase2Plan §4.4 Hypothesis 2.
+    transports: [tcp()],
     connectionEncrypters: [noise()],
     streamMuxers: [yamux({
       maxInboundStreams: 256,

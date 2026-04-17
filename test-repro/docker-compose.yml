@@ -1,0 +1,65 @@
+# Stream-reset reproduction environment
+#
+# Two isolated wesense-orbitdb containers on the same host, talking to each
+# other via localhost. Used for packet-capture diagnosis of the stream-reset
+# churn issue (Phase2Plan §4.4 Phase 4).
+#
+# Deliberately uses host networking (same as production) so the traffic
+# pattern matches what we observe in the real deployment. Ports are offset
+# from production (14002/14003 for libp2p, 15200/15201 for HTTP API) to
+# avoid conflicts with any running production instance.
+#
+# Usage:
+#   1. Copy this directory to a VPS with the wesense-orbitdb:dev image
+#   2. docker compose up -d
+#   3. In a separate terminal: run the tcpdump command from capture.sh
+#   4. In two more terminals: docker logs -f test-orbitdb-a
+#                              docker logs -f test-orbitdb-b
+#   5. Wait for "Peer disconnected" / "stream has been reset" in logs
+#   6. Stop tcpdump (Ctrl+C), analyse the .pcap file
+#   7. docker compose down && rm -rf /tmp/orbitdb-test-*
+#
+# Both containers start with EMPTY OrbitDB state (no historical poison).
+# If resets still occur → cause is in the protocol/config, not in data.
+# If resets don't occur → cause is related to accumulated poisoned state
+# (processing timeouts may create enough CPU/memory pressure to trigger
+# the resets indirectly).
+
+services:
+  orbitdb-a:
+    image: ghcr.io/wesense-earth/wesense-orbitdb:dev
+    container_name: test-orbitdb-a
+    network_mode: host
+    volumes:
+      - /tmp/orbitdb-test-a:/app/data
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - PORT=15200
+      - LIBP2P_PORT=14002
+      - DATA_DIR=/app/data
+      - ANNOUNCE_ADDRESS=127.0.0.1
+      # No bootstrap peers — this IS the bootstrap for the test
+      - ORBITDB_BOOTSTRAP_PEERS=
+      - TZ=Pacific/Auckland
+    restart: "no"
+
+  orbitdb-b:
+    image: ghcr.io/wesense-earth/wesense-orbitdb:dev
+    container_name: test-orbitdb-b
+    network_mode: host
+    depends_on:
+      - orbitdb-a
+    volumes:
+      - /tmp/orbitdb-test-b:/app/data
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - PORT=15201
+      - LIBP2P_PORT=14003
+      - DATA_DIR=/app/data
+      - ANNOUNCE_ADDRESS=127.0.0.1
+      # Dial container A
+      - ORBITDB_BOOTSTRAP_PEERS=127.0.0.1:14002
+      - TZ=Pacific/Auckland
+    restart: "no"
