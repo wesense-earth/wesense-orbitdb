@@ -238,21 +238,28 @@ const BOOTSTRAP_PEERS = process.env.ORBITDB_BOOTSTRAP_PEERS || "";
 const NODE_TTL_DAYS = parseInt(process.env.NODE_TTL_DAYS || "7", 10);
 
 // libp2p's @libp2p/connection-monitor runs a /ipfs/ping/1.0.0 probe on every
-// connection at pingIntervalMs (default 10s). If the probe exceeds its
-// AdaptiveTimeout OR any step (newStream, write, read, close) fails, it calls
-// conn.abort(err) — which cascades through muxer.abort → stream aborts →
-// TCPSocketMultiaddrConnection.abort → socket.resetAndDestroy() → TCP RST.
+// connection at pingIntervalMs (default 10s). Two scale-relevant problems
+// with the upstream defaults, both documented in StreamResetInvestigation.md:
 //
-// Under trans-continental RTT and/or transient event-loop contention this
-// triggers ~30 disconnects/hr/host in production (see
-// StreamResetInvestigation.md). Yamux keepalive (10s, enableKeepAlive:true
-// in streamMuxers below) already detects genuinely-dead connections at the
-// lower layer without tearing down the TCP socket on a single slow probe.
+//   F (resolved, see §Resolution): probe failure calls conn.abort() which
+//   cascades to a TCP RST. Was causing ~30 disconnects/hr/host in production.
+//   Disabled via abortConnectionOnPingFailure: false.
 //
-// CONNECTION_MONITOR_ABORT=false keeps the monitor running (so conn.rtt is
-// still measured for metrics) but stops it aborting connections on ping
-// failure. Left at libp2p's upstream default (true) unless explicitly
-// overridden. Test rollout: set false on one host, compare teardown rate.
+//   F2: on probe signal-abort (newStream/write/read), stream.close() is never
+//   reached, leaking an outbound /ipfs/ping/1.0.0 stream slot each time. Once
+//   the slot count hits maxOutboundStreams (default 1 for ping), all future
+//   probes on that connection fail fast with TooManyOutboundProtocolStreams,
+//   permanently starving the monitor for that connection. At 1M-host scale
+//   and the observed ~3 events/30min/host that becomes ~6M stale-slot events
+//   per hour network-wide.
+//
+// Since nothing in our code, gossipsub, or the orbitdb-fork reads conn.rtt
+// (the only useful output of the monitor) and yamux keepalive already handles
+// dead-connection detection, the monitor is pure overhead for us. Default
+// disabled. Override to true if you're debugging libp2p behaviour or want
+// RTT metrics populated. abortConnectionOnPingFailure is retained as a
+// separate knob so you can enable the monitor WITHOUT the RST behaviour.
+const CONNECTION_MONITOR_ENABLED = process.env.CONNECTION_MONITOR_ENABLED === "true";
 const CONNECTION_MONITOR_ABORT = process.env.CONNECTION_MONITOR_ABORT !== "false";
 
 // Parse ORBITDB_BOOTSTRAP_PEERS — supports multiple formats:
@@ -495,8 +502,11 @@ async function main() {
       maxIncomingPendingConnections: 50,
     },
     connectionMonitor: {
-      // See CONNECTION_MONITOR_ABORT comment above for the full rationale.
-      // Env-gated so we can A/B a single host before rolling out.
+      // See CONNECTION_MONITOR_ENABLED comment above for the full rationale.
+      // Monitor disabled by default: we don't consume conn.rtt and yamux
+      // keepalive handles liveness at the lower layer. Abort flag still
+      // honoured if the monitor is explicitly enabled.
+      enabled: CONNECTION_MONITOR_ENABLED,
       abortConnectionOnPingFailure: CONNECTION_MONITOR_ABORT,
     },
     peerDiscovery: [
