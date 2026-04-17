@@ -237,6 +237,24 @@ const ANNOUNCE_ADDRESS = process.env.ANNOUNCE_ADDRESS || "";
 const BOOTSTRAP_PEERS = process.env.ORBITDB_BOOTSTRAP_PEERS || "";
 const NODE_TTL_DAYS = parseInt(process.env.NODE_TTL_DAYS || "7", 10);
 
+// libp2p's @libp2p/connection-monitor runs a /ipfs/ping/1.0.0 probe on every
+// connection at pingIntervalMs (default 10s). If the probe exceeds its
+// AdaptiveTimeout OR any step (newStream, write, read, close) fails, it calls
+// conn.abort(err) — which cascades through muxer.abort → stream aborts →
+// TCPSocketMultiaddrConnection.abort → socket.resetAndDestroy() → TCP RST.
+//
+// Under trans-continental RTT and/or transient event-loop contention this
+// triggers ~30 disconnects/hr/host in production (see
+// StreamResetInvestigation.md). Yamux keepalive (10s, enableKeepAlive:true
+// in streamMuxers below) already detects genuinely-dead connections at the
+// lower layer without tearing down the TCP socket on a single slow probe.
+//
+// CONNECTION_MONITOR_ABORT=false keeps the monitor running (so conn.rtt is
+// still measured for metrics) but stops it aborting connections on ping
+// failure. Left at libp2p's upstream default (true) unless explicitly
+// overridden. Test rollout: set false on one host, compare teardown rate.
+const CONNECTION_MONITOR_ABORT = process.env.CONNECTION_MONITOR_ABORT !== "false";
+
 // Parse ORBITDB_BOOTSTRAP_PEERS — supports multiple formats:
 //   Full multiaddr: /ip4/203.0.113.1/tcp/4002/p2p/12D3KooW...
 //   IP:port:        203.0.113.1:4002
@@ -475,6 +493,11 @@ async function main() {
       maxConnections: 300,
       // Limit inbound connections to prevent resource exhaustion from internet scans
       maxIncomingPendingConnections: 50,
+    },
+    connectionMonitor: {
+      // See CONNECTION_MONITOR_ABORT comment above for the full rationale.
+      // Env-gated so we can A/B a single host before rolling out.
+      abortConnectionOnPingFailure: CONNECTION_MONITOR_ABORT,
     },
     peerDiscovery: [
       // mDNS for automatic LAN discovery. Non-standard port to avoid conflict
