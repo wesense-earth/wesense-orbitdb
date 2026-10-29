@@ -6,6 +6,11 @@ on:
     tags: ['v*']
   pull_request:
     branches: [main]
+  workflow_dispatch:
+  schedule:
+    # Weekly rebuild so base-image and unpinned dependency fixes ship
+    # even when no code changes.
+    - cron: '0 14 * * 0'
 
 env:
   REGISTRY: ghcr.io
