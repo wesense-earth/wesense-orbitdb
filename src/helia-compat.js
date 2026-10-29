@@ -1,17 +1,13 @@
 /**
- * Helia v6 compatibility wrapper for OrbitDB.
+ * Block fetch policy wrapper for OrbitDB.
  *
- * Helia v6 changed blockstore.get() from returning Promise<Uint8Array>
- * to returning AsyncGenerator<Uint8Array> (streaming blockstores, per
- * js-stores PR #358). OrbitDB @3.0.2 expects the old non-streaming API
- * and breaks silently when it receives an async generator instead of bytes.
+ * Helia v6 blockstore.get() returns AsyncGenerator<Uint8Array> (streaming
+ * blockstores, per js-stores PR #358), and OrbitDB 4.x reads it that way
+ * natively. This wrapper keeps that streaming interface (get() yields the
+ * block as one chunk) and is applied ONLY to the helia instance passed to
+ * createOrbitDB; helia's own internals (bitswap, pins, GC) are untouched.
  *
- * This wrapper adapts helia's streaming blockstore back to the
- * non-streaming interface that OrbitDB expects. It is applied ONLY to
- * the helia instance passed to createOrbitDB — helia's own internals
- * (bitswap, pins, GC) continue using the native streaming API.
- *
- * Additionally, this wrapper:
+ * This wrapper:
  *   - Tracks failed CID fetches with a cooldown + permanent blacklist
  *     to suppress repeated attempts on orphaned oplog entries.
  *   - Verifies blocks after put() by reading them back and checking
@@ -248,10 +244,11 @@ export function manuallyBlacklist(cidStr) {
 }
 
 /**
- * Wrap a Helia instance so its blockstore.get() returns a plain
- * Uint8Array (via Promise) instead of an AsyncGenerator.
+ * Wrap a Helia instance so its blockstore.get() applies the block fetch
+ * policy below. get() stays a streaming AsyncGenerator (it yields the
+ * block's bytes as a single chunk, capped at MAX_BLOCK_SIZE).
  *
- * Also caches failed CID lookups to prevent repeated fetches of
+ * Caches failed CID lookups to prevent repeated fetches of
  * unreachable blocks (orphaned oplog entries, corrupted identity blocks),
  * with a permanent blacklist for blocks that fail repeatedly.
  *
@@ -288,7 +285,7 @@ export function wrapHeliaForOrbitDB(helia, options = {}) {
   const blockstoreProxy = new Proxy(helia.blockstore, {
     get(target, prop) {
       if (prop === "get") {
-        return async (cid, options) => {
+        return async function * (cid, options) {
           const key = cidToString(cid);
 
           // Check permanent blacklist first — no logging, no retry
@@ -311,7 +308,8 @@ export function wrapHeliaForOrbitDB(helia, options = {}) {
             if (failedCids.has(key)) {
               failedCids.delete(key);
             }
-            return result;
+            yield result;
+            return;
           } catch (err) {
             // Record failure, preserving cumulative attempt count
             const prev = failedCids.get(key);
