@@ -618,10 +618,8 @@ async function main() {
     console.log(`Peer disconnected: ${peerId}`);
   });
 
-  // Helia v6 changed blockstore.get() to return AsyncGenerator<Uint8Array>
-  // (streaming blockstores). OrbitDB @3.0.2 expects plain Uint8Array returns.
-  // Wrap helia so OrbitDB gets the non-streaming API it needs.
-  // See: https://github.com/orbitdb/orbitdb/issues/1244
+  // OrbitDB 4.x reads Helia v6's streaming blockstore.get() natively. The
+  // wrapper adds the failed-block cache and write verification (helia-compat.js).
   const heliaForOrbitDB = wrapHeliaForOrbitDB(helia);
 
   const orbitdb = await createOrbitDB({
