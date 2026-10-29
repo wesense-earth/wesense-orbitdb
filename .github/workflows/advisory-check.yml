@@ -1,0 +1,61 @@
+name: Upstream advisory check
+
+# Dependabot only alerts on advisories in GitHub's reviewed database. js-libp2p (and helia,
+# orbitdb) publish advisories in their own repositories, and several of those never became
+# Dependabot alerts here, so `npm audit` reported 0 while installed versions were affected.
+# This reads those repositories' published advisories and compares them with package-lock.json.
+# A finding opens (or updates) one issue; the issue closes itself once nothing is affected.
+# Details: https://docs.wesense.earth/developers/dependency-updates
+
+on:
+  schedule:
+    - cron: '45 3 * * *'
+  push:
+    branches: [main]
+    paths: [package-lock.json, .github/scripts/check-advisories.mjs]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  advisories:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install semver (pinned, no scripts)
+        run: npm install --prefix "$RUNNER_TEMP/tools" --ignore-scripts semver@7.7.4
+
+      - name: Check
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SEMVER_FROM: ${{ runner.temp }}/tools/package.json
+          OUTPUT_FILE: ${{ runner.temp }}/findings.md
+        run: node .github/scripts/check-advisories.mjs
+
+      - name: Open, update or close the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FINDINGS: ${{ runner.temp }}/findings.md
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Security: installed packages are affected by upstream-published advisories"
+          existing=$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number // empty')
+          if [ -s "$FINDINGS" ]; then
+            { cat "$FINDINGS"; printf '\n\nFound by %s. Fix by updating the affected packages; Dependabot cannot see these advisories. This issue closes itself when nothing is affected.\n' "$RUN_URL"; } > "$RUNNER_TEMP/body.md"
+            if [ -n "$existing" ]; then
+              gh issue edit "$existing" --body-file "$RUNNER_TEMP/body.md"
+            else
+              gh issue create --title "$title" --body-file "$RUNNER_TEMP/body.md"
+            fi
+            exit 1
+          elif [ -n "$existing" ]; then
+            gh issue close "$existing" --comment "No installed package is affected any more ($RUN_URL)."
+          fi
