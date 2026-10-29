@@ -1,0 +1,47 @@
+name: Replication test
+
+# Two real containers must replicate to each other, including when one runs the
+# currently published image and the other runs this change (a rolling upgrade).
+# The per-build smoke test only imports packages; it cannot catch a version that
+# starts fine but no longer talks to the stations already running.
+# Details: https://docs.wesense.earth/developers/dependency-updates
+
+on:
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '30 16 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  replication:
+    name: replication
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build this change
+        run: docker build -t orbitdb-candidate .
+
+      - name: Pull the published image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_ACTOR: ${{ github.actor }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GH_ACTOR" --password-stdin
+          docker pull ghcr.io/wesense-earth/wesense-orbitdb:latest
+          docker tag ghcr.io/wesense-earth/wesense-orbitdb:latest orbitdb-published
+
+      - name: New with new
+        run: scripts/replication-test.sh orbitdb-candidate orbitdb-candidate
+
+      - name: Published A, new B
+        run: scripts/replication-test.sh orbitdb-published orbitdb-candidate
+
+      - name: New A, published B
+        run: scripts/replication-test.sh orbitdb-candidate orbitdb-published
