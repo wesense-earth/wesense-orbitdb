@@ -18,7 +18,7 @@
  */
 
 // Must be imported before any helia/libp2p code to patch stream prototypes.
-import { patchRegistrarForLegacyHandlers } from "./libp2p-stream-compat.js";
+import "./libp2p-stream-compat.js"; // side effect: duplex shim for OrbitDB (see file)
 import { installTeardownTrace, wrapYamux } from "./teardown-trace.js";
 
 // Patch AbstractMessageStream.abort/close before any connections are
@@ -35,7 +35,7 @@ import { yamux as rawYamux } from "@chainsafe/libp2p-yamux";
 const yamux = wrapYamux(rawYamux);
 import { tcp } from "@libp2p/tcp";
 import { mdns } from "@libp2p/mdns";
-import { gossipsub } from "@chainsafe/libp2p-gossipsub";
+import { gossipsub } from "@libp2p/gossipsub";
 import { identify } from "@libp2p/identify";
 import { ping } from "@libp2p/ping";
 import { FsBlockstore } from "blockstore-fs";
@@ -539,10 +539,6 @@ async function main() {
       }),
     },
   });
-
-  // Patch registrar before helia starts libp2p — wraps handler signatures
-  // for gossipsub and OrbitDB protocols (see libp2p-stream-compat.js).
-  patchRegistrarForLegacyHandlers(libp2p);
 
   // Helia defaults add trustlessGateway(), httpGatewayRouting(), and
   // libp2pRouting() which connect to the public IPFS network. Disable all
