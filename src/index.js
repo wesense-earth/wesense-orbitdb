@@ -519,6 +519,14 @@ async function main() {
       ping: ping(),
       pubsub: gossipsub({
         allowPublishToZeroTopicPeers: true,
+        // No floodsub fallback. It is a legacy protocol WeSense does not need, it has its
+        // own security advisories, and advertising it matters for another reason: libp2p
+        // tells components about a new peer in alphabetical protocol order, '/floodsub/1.0.0'
+        // sorts before '/ipfs/bitswap/1.2.0', and gossipsub 14 on older stations throws on
+        // that entry (multiaddr.tuples() was removed in multiaddr 13), which aborts the
+        // loop before bitswap hears about us. Not advertising it lets older stations
+        // learn that we serve blocks. See issue #38.
+        fallbackToFloodsub: false,
         maxInboundDataLength: 2 * 1024 * 1024, // 2MB — reject oversized gossipsub messages
         // Enable Peer Exchange (PX). When a station grafts/prunes a peer out of
         // the mesh, PX messages include known-peer records (peer ID + addresses
