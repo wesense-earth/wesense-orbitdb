@@ -9,6 +9,7 @@
  */
 
 import { Router } from "express";
+import { getValue, requireJsonBody } from "./util.js";
 
 /**
  * @param {object} storesDb - OrbitDB Documents database
@@ -39,7 +40,7 @@ export function createStoresRouter(storesDb) {
   const router = Router();
 
   // Register or update store scope for a node
-  router.put("/:id", async (req, res) => {
+  router.put("/:id", requireJsonBody, async (req, res) => {
     try {
       const store_id = req.params.id;
       if (store_id.length > MAX_ID_LENGTH) {
@@ -155,11 +156,11 @@ export function createStoresRouter(storesDb) {
       if (req.params.id.length > MAX_ID_LENGTH) {
         return res.status(400).json({ error: "ID too long" });
       }
-      const doc = await storesDb.get(req.params.id);
-      if (!doc || doc.length === 0) {
+      const doc = await getValue(storesDb, req.params.id);
+      if (!doc) {
         return res.status(404).json({ error: "not found" });
       }
-      res.json(doc[0].value);
+      res.json(doc);
     } catch (err) {
       console.error("GET /stores/:id error:", err);
       res.status(500).json({ error: "Internal error" });
