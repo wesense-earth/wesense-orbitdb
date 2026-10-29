@@ -8,6 +8,7 @@
  */
 
 import { Router } from "express";
+import { getValue, requireJsonBody } from "./util.js";
 
 /**
  * @param {object} attestationsDb - OrbitDB Documents database (indexBy: manifest_hash)
@@ -21,7 +22,7 @@ export function createAttestationsRouter(attestationsDb) {
   const router = Router();
 
   // Submit an attestation for an archive
-  router.put("/:manifest_hash", async (req, res) => {
+  router.put("/:manifest_hash", requireJsonBody, async (req, res) => {
     try {
       const manifest_hash = req.params.manifest_hash;
       if (manifest_hash.length > MAX_HASH_LENGTH) {
@@ -37,11 +38,8 @@ export function createAttestationsRouter(attestationsDb) {
       }
 
       // Fetch existing to append attestation
-      const existing = await attestationsDb.get(manifest_hash);
-      let attestations = [];
-      if (existing && existing.length > 0 && existing[0].value.attestations) {
-        attestations = [...existing[0].value.attestations];
-      }
+      const existingDoc = (await getValue(attestationsDb, manifest_hash)) || {};
+      const attestations = [...(existingDoc.attestations || [])];
 
       if (attestations.length >= MAX_ATTESTATIONS_PER_ARCHIVE) {
         return res.status(400).json({ error: "Maximum attestations reached" });
@@ -57,7 +55,6 @@ export function createAttestationsRouter(attestationsDb) {
       }
 
       // Preserve iroh_blake3_hash and path from request body or existing doc
-      const existingDoc = existing && existing.length > 0 ? existing[0].value : {};
       const finalBlake3 =
         (typeof iroh_blake3_hash === "string" ? iroh_blake3_hash : null) || existingDoc.iroh_blake3_hash || null;
       const finalPath =
@@ -106,11 +103,11 @@ export function createAttestationsRouter(attestationsDb) {
       if (req.params.manifest_hash.length > MAX_HASH_LENGTH) {
         return res.status(400).json({ error: "Hash too long" });
       }
-      const doc = await attestationsDb.get(req.params.manifest_hash);
-      if (!doc || doc.length === 0) {
+      const doc = await getValue(attestationsDb, req.params.manifest_hash);
+      if (!doc) {
         return res.status(404).json({ error: "not found" });
       }
-      res.json(doc[0].value);
+      res.json(doc);
     } catch (err) {
       console.error("GET /attestations/:manifest_hash error:", err);
       res.status(500).json({ error: "Internal error" });
@@ -120,12 +117,11 @@ export function createAttestationsRouter(attestationsDb) {
   // Consensus status for an archive
   router.get("/:manifest_hash/consensus", async (req, res) => {
     try {
-      const doc = await attestationsDb.get(req.params.manifest_hash);
-      if (!doc || doc.length === 0) {
+      const val = await getValue(attestationsDb, req.params.manifest_hash);
+      if (!val) {
         return res.status(404).json({ error: "not found" });
       }
 
-      const val = doc[0].value;
       const attestations = val.attestations || [];
       const count = attestations.length;
 

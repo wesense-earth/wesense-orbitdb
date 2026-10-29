@@ -8,6 +8,7 @@
  */
 
 import { Router } from "express";
+import { getValue, requireJsonBody } from "./util.js";
 
 /**
  * @param {object} nodesDb - OrbitDB Documents database (indexBy: ingester_id)
@@ -40,7 +41,7 @@ export function createNodesRouter(nodesDb) {
   const router = Router();
 
   // Register or update a node
-  router.put("/:id", async (req, res) => {
+  router.put("/:id", requireJsonBody, async (req, res) => {
     try {
       const ingester_id = req.params.id;
       if (ingester_id.length > MAX_ID_LENGTH) {
@@ -92,11 +93,11 @@ export function createNodesRouter(nodesDb) {
       if (req.params.id.length > MAX_ID_LENGTH) {
         return res.status(400).json({ error: "ID too long" });
       }
-      const doc = await nodesDb.get(req.params.id);
-      if (!doc || doc.length === 0) {
+      const doc = await getValue(nodesDb, req.params.id);
+      if (!doc) {
         return res.status(404).json({ error: "not found" });
       }
-      res.json(doc[0].value);
+      res.json(doc);
     } catch (err) {
       console.error("GET /nodes/:id error:", err);
       res.status(500).json({ error: "Internal error" });

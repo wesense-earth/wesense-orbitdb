@@ -8,6 +8,7 @@
  */
 
 import { Router } from "express";
+import { getValue, requireJsonBody } from "./util.js";
 
 /**
  * @param {object} trustDb - OrbitDB Documents database (indexBy: ingester_id)
@@ -20,7 +21,7 @@ export function createTrustRouter(trustDb) {
   const router = Router();
 
   // Add or update a trusted key
-  router.put("/:ingester_id", async (req, res) => {
+  router.put("/:ingester_id", requireJsonBody, async (req, res) => {
     try {
       const ingester_id = req.params.ingester_id;
       if (ingester_id.length > MAX_ID_LENGTH) {
@@ -39,11 +40,8 @@ export function createTrustRouter(trustDb) {
       }
 
       // Fetch existing entry to merge versions
-      const existing = await trustDb.get(ingester_id);
-      let versions = {};
-      if (existing && existing.length > 0 && existing[0].value.versions) {
-        versions = { ...existing[0].value.versions };
-      }
+      const existing = await getValue(trustDb, ingester_id);
+      const versions = { ...(existing?.versions || {}) };
 
       if (Object.keys(versions).length >= MAX_VERSIONS && !(String(key_version) in versions)) {
         return res.status(400).json({ error: "Too many key versions" });
@@ -94,11 +92,11 @@ export function createTrustRouter(trustDb) {
       if (req.params.ingester_id.length > MAX_ID_LENGTH) {
         return res.status(400).json({ error: "ID too long" });
       }
-      const doc = await trustDb.get(req.params.ingester_id);
-      if (!doc || doc.length === 0) {
+      const doc = await getValue(trustDb, req.params.ingester_id);
+      if (!doc) {
         return res.status(404).json({ error: "not found" });
       }
-      res.json(doc[0].value);
+      res.json(doc);
     } catch (err) {
       console.error("GET /trust/:ingester_id error:", err);
       res.status(500).json({ error: "Internal error" });
@@ -112,13 +110,12 @@ export function createTrustRouter(trustDb) {
       if (ingester_id.length > MAX_ID_LENGTH) {
         return res.status(400).json({ error: "ID too long" });
       }
-      const existing = await trustDb.get(ingester_id);
-      if (!existing || existing.length === 0) {
+      const existing = await getValue(trustDb, ingester_id);
+      if (!existing) {
         return res.status(404).json({ error: "not found" });
       }
 
-      const val = existing[0].value;
-      const versions = val.versions || {};
+      const versions = existing.versions || {};
       for (const ver of Object.keys(versions)) {
         versions[ver].status = "revoked";
         versions[ver].revoked_at = new Date().toISOString();

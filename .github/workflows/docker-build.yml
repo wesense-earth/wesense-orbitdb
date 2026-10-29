@@ -115,6 +115,10 @@ jobs:
         run: |
           docker run --rm -i -w /app --entrypoint node smoke:test --input-type=module - < .github/smoke/check_deps.mjs
 
+      - name: Route tests
+        run: |
+          docker run --rm -v "$PWD/test:/app/test:ro" -w /app --entrypoint node smoke:test --test
+
   # ── Merge platform images into a single multi-arch manifest ───────
   merge:
     if: github.event_name != 'pull_request'
