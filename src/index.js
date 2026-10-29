@@ -1407,6 +1407,8 @@ async function main() {
   // but harden anyway since network_mode: host exposes it on all interfaces.
   const app = express();
   app.use(express.json({ limit: "100kb" }));
+  // Express 5 leaves req.body undefined when no body is sent; keep the Express 4 behaviour.
+  app.use((req, res, next) => { req.body ??= {}; next(); });
 
   app.use("/nodes", createNodesRouter(dbs.nodes));
   app.use("/trust", createTrustRouter(dbs.trust));
