@@ -49,16 +49,21 @@ wait_for_record() { # port id label
 
 docker network create "$NET" >/dev/null
 docker run -d --name "$A" --network "$NET" -p "$PORT_A:5200" \
-  -e ORBITDB_BOOTSTRAP_PEERS= -e ANNOUNCE_ADDRESS="$A" "$IMG_A" >/dev/null
+  ${EXTRA_ENV:-} -e ORBITDB_BOOTSTRAP_PEERS= -e ANNOUNCE_ADDRESS="$A" "$IMG_A" >/dev/null
 wait_http "$PORT_A" || { docker logs "$A" 2>&1 | tail -20; exit 1; }
+
+# Late-joiner case: data written on A before B exists must reach B when it joins.
+curl -s -m 20 -X PUT -H 'content-type: application/json' -d '{"node_name":"written-on-A-early"}' \
+  "localhost:$PORT_A/nodes/repl-early" -o /dev/null
 
 PEER_ID=$(curl -s -m 5 "localhost:$PORT_A/health" | python3 -c "import sys,json; print(json.load(sys.stdin)['libp2p_peer_id'])")
 docker run -d --name "$B" --network "$NET" -p "$PORT_B:5200" \
-  -e ORBITDB_BOOTSTRAP_PEERS="/dns4/$A/tcp/4002/p2p/$PEER_ID" -e ANNOUNCE_ADDRESS="$B" "$IMG_B" >/dev/null
+  ${EXTRA_ENV:-} -e ORBITDB_BOOTSTRAP_PEERS="/dns4/$A/tcp/4002/p2p/$PEER_ID" -e ANNOUNCE_ADDRESS="$B" "$IMG_B" >/dev/null
 wait_http "$PORT_B" || { docker logs "$B" 2>&1 | tail -20; exit 1; }
 sleep "$SETTLE_SECONDS"
 
 status=0
+wait_for_record "$PORT_B" repl-early "A (before B joined) -> B" || status=1
 echo "A=$IMG_A  B=$IMG_B"
 curl -s -m 20 -X PUT -H 'content-type: application/json' -d '{"node_name":"written-on-A"}' \
   "localhost:$PORT_A/nodes/repl-a" -o /dev/null -w "PUT on A: %{http_code} in %{time_total}s\n"
