@@ -911,8 +911,13 @@ async function main() {
     });
   }
 
-  // Replication trigger — when a WeSense peer connects, write a sync marker
-  // to force HEAD re-publication so the new peer gets current data.
+  // Replication trigger (OFF by default; SYNC_MARKER_ENABLED=true to enable).
+  // Writes a sync marker to force HEAD re-publication so a newly connected
+  // peer gets current data. It was added in Feb 2026 as a workaround for
+  // gossipsub streams that did not stay up (fixed since in #43). Every marker
+  // is a permanent, pinned oplog entry on every peer, so enabling it grows
+  // the datastore and blockstore without bound (~288 entries/day/node).
+  const SYNC_MARKER_ENABLED = process.env.SYNC_MARKER_ENABLED === "true";
   let lastSyncTrigger = 0;
   const SYNC_DEBOUNCE = 60_000;
 
@@ -944,7 +949,7 @@ async function main() {
   };
 
   let syncPending = false;
-  helia.libp2p.addEventListener("peer:connect", () => {
+  if (SYNC_MARKER_ENABLED) helia.libp2p.addEventListener("peer:connect", () => {
     if (syncPending) return;
     const now = Date.now();
     if (now - lastSyncTrigger < SYNC_DEBOUNCE) return;
@@ -960,7 +965,7 @@ async function main() {
   });
 
   // Periodic fallback — re-trigger every 10 minutes if WeSense peers are connected
-  setInterval(async () => {
+  if (SYNC_MARKER_ENABLED) setInterval(async () => {
     const wesensePeers = getWesensePeerCount();
     if (wesensePeers === 0) return;
     await triggerSync(`periodic, ${wesensePeers} WeSense peers`);
